@@ -1,4 +1,4 @@
-"""Serial CPU CIDER26XCSURFSCI for New GPAW PW calculations.
+"""CPU CIDER26XCSURFSCI for New GPAW PW, with redundant k-point XC.
 
 Term                       Counted by
 =========================  ================================================
@@ -16,6 +16,7 @@ Density packing doubles off-diagonal entries; Hamiltonian packing does not.
 
 import hashlib
 from copy import copy
+from functools import lru_cache
 from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,27 @@ from ciderpress.gpaw.cider_fft import (
 from ciderpress.gpaw.cider_kernel import CiderMGGAHybridKernel
 from ciderpress.gpaw.cider_paw import CiderPASDW_MPRoutines
 from ciderpress.gpaw.config import GPAW_DEFAULT_RHO_TOL
+from ciderpress.gpaw.nldf_interface import pwutil
+
+
+@lru_cache(maxsize=1)
+def _process_comm():
+    """Private size-one communicator shared by FFT and PASDW on this process.
+
+    Serial CiderPress needs no native MPI object. MPI CiderPress needs a real
+    one even on one rank: the generic GPAW native API duplicates MPI_COMM_SELF.
+    That operation is collective only on SELF, never on GPAW world/k-point
+    groups; unequal functional construction counts across ranks are safe.
+    """
+    if not pwutil.ciderpw_has_mpi():
+        return serial_comm
+    from gpaw import cgpaw
+    if not cgpaw.have_mpi or not hasattr(cgpaw.Communicator, 'self_communicator'):
+        raise RuntimeError('MPI CiderPress requires GPAW native self_communicator(); '
+                           'rebuild the GPAW extension with the Phase 2 MPI hook')
+    comm = cgpaw.Communicator().self_communicator()
+    assert comm.size == 1 and comm.rank == 0
+    return comm
 
 
 class CiderXC(XC):
@@ -157,7 +179,7 @@ class _Engine(CiderPASDW_MPRoutines, _CiderBase):
                                       opts['xkernel'], opts['ckernel'])
         _CiderBase.__init__(self, kernel, Nalpha=opts['Nalpha'],
                             lambd=opts['lambd'], encut=opts['qmax'],
-                            world=serial_comm)
+                            world=_process_comm())
         self.pasdw_ovlp_fit = opts['pasdw_ovlp_fit']
         self.pasdw_store_funcs = opts['pasdw_store_funcs']
         self.interpolate_dn1 = False
@@ -169,7 +191,7 @@ class _Engine(CiderPASDW_MPRoutines, _CiderBase):
         self.timer = Timer()
         self.grad_v = [g.apply for g in grad_v]
         self.set_grid_descriptor(grid._gd)
-        self.aux_gd = self.gd
+        self.aux_gd = self.gd.new_descriptor(comm=self.world)
         self.atomdist = _SerialAtomDist()
 
     def initialize_more_things(self):
@@ -191,15 +213,20 @@ class CiderNewMGGAFunctional(MGGAFunctional):
     ``to_xp(np)`` before entering the Classic numpy numerical engine.
     """
 
-    def __init__(self, param, grid, xp=np):
+    def __init__(self, param, grid, xp=np, *, _allow_fake_gpu=False):
         if xp is not np:
-            raise NotImplementedError('New CIDER Phase 2 supports CPU numpy only')
+            from gpaw.gpu import cupy, cupy_is_fake
+            if not (_allow_fake_gpu and cupy_is_fake and xp is cupy):
+                raise NotImplementedError('New CIDER Phase 2 supports CPU numpy only')
         if grid.comm.size != 1:
             raise NotImplementedError('New CIDER does not support domain parallelism')
         old = MGGA(LibXC('PBE'), stencil=2)
         old.type = 'MGGA'
         old.name = 'CIDER26XCSURFSCI'
-        super().__init__(old, grid, xp)
+        # MGGA's wrapper and finite-difference gradient kernels must stay on
+        # numpy even when calculate() is fed device arrays in a later phase.
+        super().__init__(old, grid)
+        self.xp = xp
         self.param = param
         self.engine = _Engine(param, grid, self.grad_v)
         self._relpos = None
@@ -208,11 +235,13 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         self._paw_ready = False
 
     def set_context(self, *, setups, relpos_ac, atomdist,
-                    communicators=None, mode='pw'):
+                    communicators=None, mode='pw', distribute_density=False):
         if mode != 'pw':
             raise NotImplementedError('New CIDER supports PW mode only')
+        if distribute_density:
+            raise NotImplementedError('New CIDER does not support distributed density')
         if communicators is not None:
-            for key, label in [('d', 'domain'), ('b', 'band'), ('w', 'MPI/k-point')]:
+            for key, label in [('d', 'domain'), ('b', 'band')]:
                 if communicators[key].size != 1:
                     raise NotImplementedError('New CIDER does not support ' + label +
                                               ' parallelism')
@@ -238,7 +267,7 @@ class CiderNewMGGAFunctional(MGGAFunctional):
                     copies[id(setup)] = clone
                 engine.setups[a] = copies[id(setup)]
         engine.spos_ac = self._relpos
-        engine.atom_partition = AtomPartition(serial_comm, atomdist.rank_a.copy())
+        engine.atom_partition = AtomPartition(engine.world, atomdist.rank_a.copy())
         if self._density is None:
             engine.dens = SimpleNamespace(setups=engine.setups)
 
@@ -313,4 +342,7 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         self.validate_force_calculation()
 
     def stress_contribution(self, *args, **kwargs):
+        self.validate_stress_calculation()
+
+    def validate_stress_calculation(self):
         raise NotImplementedError('New CIDER stress is not implemented')
