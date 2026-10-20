@@ -268,7 +268,7 @@ def get_delta_lpg(betas_lb, rcut, rgd, pmin, pmax):
         funcs[:, rgd.r_g > rcut] = 0
         funcs_tmp = funcs * r_g**l * np.sqrt(dv_g)
         ovlp = np.einsum("ig,jg->ij", funcs_tmp, funcs_tmp)
-        L = cholesky(ovlp, lower=True)
+        L = np.tril(cholesky(ovlp, lower=True))
         basis = np.linalg.solve(L, funcs)
         delta_lpg.append(basis * r_g**l)
     return delta_lpg

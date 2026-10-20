@@ -195,7 +195,11 @@ class CiderPASDW_MPRoutines:
                 coefs_iq = np.ndarray(shapes[a], buffer=buf)
                 coefs_iq = np.ndarray(shapes[a], buffer=buf)
                 if comm.rank == rank_a[a]:
-                    coefs_iq[:] = self.c_asiq[a][s]
+                    if self.pasdw_ovlp_fit:
+                        coefs_iq[:] = global_slices[a].sinv_pf.dot(
+                            self.c_asiq[a][s])
+                    else:
+                        coefs_iq[:] = self.c_asiq[a][s]
                 comm.broadcast(coefs_iq, rank_a[a])
             if atom_slice is not None and atom_slices[a].rad_g.size > 0:
                 self.timer.start("funcs")
