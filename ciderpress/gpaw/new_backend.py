@@ -1,0 +1,316 @@
+"""Serial CPU CIDER26XCSURFSCI for New GPAW PW calculations.
+
+Term                       Counted by
+=========================  ================================================
+Smooth grid XC             calculate(): integral of the fine-grid energy
+PAW AE minus pseudo XC     calculate_paw_correction(): owned atom only
+PAW XC Hamiltonian         dH_sp += correction (pack_hermitian convention)
+Pseudo core density/tau    supplied by New Density, never added here
+Kinetic energy correction  New PotentialCalculator, never calculated here
+=========================  ================================================
+
+The Classic PASDW/NLDF numerical routines are composed through a small engine;
+no Classic calculator, MGGA calculate_impl, tau builder or ekin is invoked.
+Density packing doubles off-diagonal entries; Hamiltonian packing does not.
+"""
+
+import hashlib
+from copy import copy
+from importlib.resources import files
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import yaml
+from gpaw.dft import XC
+from gpaw.mpi import serial_comm
+from gpaw.new.xc import MGGAFunctional
+from gpaw.utilities import pack_density
+from gpaw.utilities.partition import AtomPartition
+from gpaw.utilities.timing import Timer
+from gpaw.xc.libxc import LibXC
+from gpaw.xc.mgga import MGGA
+
+from ciderpress.dft.model_utils import (
+    get_builtin_model_name,
+    validate_cider_composition,
+)
+from ciderpress.gpaw.cider_fft import (
+    _CiderBase,
+    add_gradient_correction,
+)
+from ciderpress.gpaw.cider_kernel import CiderMGGAHybridKernel
+from ciderpress.gpaw.cider_paw import CiderPASDW_MPRoutines
+from ciderpress.gpaw.config import GPAW_DEFAULT_RHO_TOL
+
+
+class CiderXC(XC):
+    """Serializable, fail-closed New-GPAW XC parameter (CPU PW only).
+
+    Use ``GPAW(..., xc=CiderXC(), legacy_gpaw=False)`` and restore GPWs with
+    ``object_hooks={'xc': restore_cider_xc}``. Both the requested interpolation
+    parameters and the derived parameters are saved, to detect incompatible
+    numerical settings on restoration. Explicit YAML paths are supported.
+    """
+
+    type = 'MGGA'
+
+    def __init__(self, model='CIDER26XCSURFSCI', *, xmix=1.0,
+                 xkernel=None, ckernel=None, Nalpha=None, lambd=1.8,
+                 qmax=300.0, pasdw_ovlp_fit=True, pasdw_store_funcs=False):
+        super().__init__('CIDER26XCSURFSCI')
+        builtin = get_builtin_model_name(model)
+        self.model = str(model)
+        path = (files('ciderpress.data.functionals').joinpath(builtin + '.yaml')
+                if builtin else Path(model))
+        # Hash the exact bytes parsed, not a later reopening of the file.
+        data = path.read_bytes()
+        self.model_sha256 = hashlib.sha256(data).hexdigest()
+        self.mlfunc = yaml.load(data, Loader=yaml.CLoader)
+        validate_cider_composition(self.mlfunc, xmix=xmix, xkernel=xkernel,
+                                   ckernel=ckernel, backend='GPAW')
+        settings = self.mlfunc.settings
+        if (settings.sl_settings.level != 'MGGA' or
+                settings.nldf_settings.is_empty or
+                settings.nldf_settings.version != 'j' or
+                not settings.nlof_settings.is_empty or
+                not settings.sdmx_settings.is_empty):
+            raise NotImplementedError('New CIDER requires MGGA with version-j NLDF')
+        if lambd <= 1 or qmax <= 0 or (Nalpha is not None and Nalpha < 2):
+            raise ValueError('Invalid NLDF interpolation parameters')
+        self.options = dict(xmix=xmix, xkernel=xkernel, ckernel=ckernel,
+                            Nalpha=Nalpha, lambd=lambd, qmax=qmax,
+                            pasdw_ovlp_fit=pasdw_ovlp_fit,
+                            pasdw_store_funcs=pasdw_store_funcs)
+        kernel = CiderMGGAHybridKernel(self.mlfunc, xmix, xkernel, ckernel)
+        base = _CiderBase(kernel, Nalpha=Nalpha, lambd=lambd, encut=qmax,
+                          world=serial_comm)
+        self.nldf = dict(Nalpha=base.Nalpha, lambd=float(base.lambd),
+                         qmax=qmax, encut=qmax, rhocut=GPAW_DEFAULT_RHO_TOL,
+                         expcut=GPAW_DEFAULT_RHO_TOL,
+                         alpha_formula='etb', coef_order='gq',
+                         use_smooth_expnt_cutoff=True,
+                         encut_atom_min=8000.0, interpolate_dn1=False,
+                         cut_xcgrid=False, stencil=2)
+        self._cell = None
+
+    def todict(self):
+        return dict(name=self.name, cider_new_version=1, model=self.model,
+                    model_sha256=self.model_sha256, options=self.options.copy(),
+                    nldf=self.nldf.copy(), cell=self._cell)
+
+    def functional(self, *, collinear, atoms=None):
+        if not collinear:
+            raise NotImplementedError('New CIDER does not support spin polarization')
+        if atoms is not None:
+            cell = atoms.cell.array.tolist()
+            if self._cell is not None and not np.array_equal(cell, self._cell):
+                raise NotImplementedError('New CIDER does not support cell changes')
+            self._cell = cell
+        return self
+
+    def new_functional(self, grid, xp=np):
+        return CiderNewMGGAFunctional(self, grid, xp)
+
+    def get_setup_name(self):
+        return 'PBE'
+
+
+def restore_cider_xc(d, *, expected=None):
+    """GPW object hook; refuse changed model bytes or NLDF implementation.
+
+    ``expected=CiderXC(...)`` additionally pins the caller's desired settings.
+    """
+    if d.get('cider_new_version') != 1:
+        raise ValueError('Unsupported New CIDER restart schema')
+    xc = CiderXC(d['model'], **d['options'])
+    if d['model_sha256'] != xc.model_sha256:
+        raise ValueError('New CIDER model SHA256 mismatch')
+    if d['nldf'] != xc.nldf:
+        raise ValueError('New CIDER NLDF settings mismatch')
+    xc._cell = d['cell']
+    if expected is not None:
+        for key in ('model_sha256', 'options', 'nldf'):
+            if xc.todict()[key] != expected.todict()[key]:
+                raise ValueError('New CIDER requested settings mismatch: ' + key)
+    return xc
+
+
+class _SerialAtomDist:
+    """Classic work-distribution protocol: all atoms owned once in serial."""
+
+    @staticmethod
+    def to_work(a):
+        return a
+
+    @staticmethod
+    def from_work(a):
+        return a
+
+
+class _Engine(CiderPASDW_MPRoutines, _CiderBase):
+    """Compose the unchanged Classic numerical engine, without Classic MGGA."""
+
+    def __init__(self, param, grid, grad_v):
+        opts = param.options
+        kernel = CiderMGGAHybridKernel(param.mlfunc, opts['xmix'],
+                                      opts['xkernel'], opts['ckernel'])
+        _CiderBase.__init__(self, kernel, Nalpha=opts['Nalpha'],
+                            lambd=opts['lambd'], encut=opts['qmax'],
+                            world=serial_comm)
+        self.pasdw_ovlp_fit = opts['pasdw_ovlp_fit']
+        self.pasdw_store_funcs = opts['pasdw_store_funcs']
+        self.interpolate_dn1 = False
+        self.encut_atom_min = 8000.0
+        self.cut_xcgrid = False
+        self.k2_k = None
+        self.setups = None
+        self.atom_slices_s = None
+        self.timer = Timer()
+        self.grad_v = [g.apply for g in grad_v]
+        self.set_grid_descriptor(grid._gd)
+        self.aux_gd = self.gd
+        self.atomdist = _SerialAtomDist()
+
+    def initialize_more_things(self):
+        # Same PAW initialization as Classic, with an explicit context instead
+        # of the Classic Hamiltonian/wavefunction objects.
+        encut, nalpha = self.encut, self.Nalpha
+        while encut < self.encut_atom_min:
+            encut *= self.lambd
+            nalpha += 1
+        self.initialize_paw_kernel(self.cider_kernel, nalpha, encut)
+
+
+class CiderNewMGGAFunctional(MGGAFunctional):
+    """Fine-grid CIDER XC. See the module's term-counting table.
+
+    ``calculate`` returns only grid XC and derivatives; the cached PAW XC
+    energy is returned once per owned atom by ``calculate_paw_correction``.
+    No tauct or kinetic correction is added. Input arrays are converted with
+    ``to_xp(np)`` before entering the Classic numpy numerical engine.
+    """
+
+    def __init__(self, param, grid, xp=np):
+        if xp is not np:
+            raise NotImplementedError('New CIDER Phase 2 supports CPU numpy only')
+        if grid.comm.size != 1:
+            raise NotImplementedError('New CIDER does not support domain parallelism')
+        old = MGGA(LibXC('PBE'), stencil=2)
+        old.type = 'MGGA'
+        old.name = 'CIDER26XCSURFSCI'
+        super().__init__(old, grid, xp)
+        self.param = param
+        self.engine = _Engine(param, grid, self.grad_v)
+        self._relpos = None
+        self.setups = None
+        self._density = None
+        self._paw_ready = False
+
+    def set_context(self, *, setups, relpos_ac, atomdist,
+                    communicators=None, mode='pw'):
+        if mode != 'pw':
+            raise NotImplementedError('New CIDER supports PW mode only')
+        if communicators is not None:
+            for key, label in [('d', 'domain'), ('b', 'band'), ('w', 'MPI/k-point')]:
+                if communicators[key].size != 1:
+                    raise NotImplementedError('New CIDER does not support ' + label +
+                                              ' parallelism')
+        if atomdist.comm.size != 1 or np.any(atomdist.rank_a != 0):
+            raise NotImplementedError('New CIDER requires serial atom distribution')
+        if self._relpos is not None and not np.array_equal(relpos_ac, self._relpos):
+            raise NotImplementedError('New CIDER does not support atom moves')
+        self._relpos = np.array(relpos_ac, copy=True)
+        engine = self.engine
+        if self.setups is not None and setups is not self.setups:
+            raise NotImplementedError('New CIDER does not support replacing setups')
+        if self.setups is None:
+            self.setups = setups
+            # PASDW writes functional-specific radial plans/contribution caches
+            # onto Setup objects. Keep those private to this engine, including
+            # when evaluating a second XC on the same New density/setups.
+            engine.setups = copy(setups)
+            copies = {}
+            for a, setup in enumerate(setups):
+                if id(setup) not in copies:
+                    clone = copy(setup)
+                    clone.cider_contribs = None
+                    copies[id(setup)] = clone
+                engine.setups[a] = copies[id(setup)]
+        engine.spos_ac = self._relpos
+        engine.atom_partition = AtomPartition(serial_comm, atomdist.rank_a.copy())
+        if self._density is None:
+            engine.dens = SimpleNamespace(setups=engine.setups)
+
+    def set_density(self, density):
+        if density.nt_sR.dims != (1,):
+            raise NotImplementedError('New CIDER does not support spin polarization')
+        if density.nt_sR.desc.comm.size != 1:
+            raise NotImplementedError('New CIDER does not support domain parallelism')
+        engine = self.engine
+        if engine.setups is None:
+            raise RuntimeError('New CIDER requires set_context before set_density')
+        matrices = density.D_asii.to_xp(np)
+        if (matrices.layout.atomdist.comm.size != 1 or
+                not np.array_equal(matrices.layout.atomdist.rank_a,
+                                   engine.atom_partition.rank_a)):
+            raise NotImplementedError('New CIDER density atom distribution mismatch')
+        if set(matrices.keys()) != set(range(len(engine.setups))):
+            raise ValueError('New CIDER requires each atom exactly once')
+        D_asp = engine.setups.empty_atomic_matrix(1, engine.atom_partition)
+        for a, D_sii in matrices.items():
+            D_asp[a][:] = [pack_density(D_ii.real) for D_ii in D_sii]
+        engine.dens.D_asp = D_asp
+        self._density = density
+        self._paw_ready = False
+
+    def calculate(self, nt_sr, taut_sr=None):
+        self._paw_ready = False
+        if nt_sr.dims != (1,):
+            raise NotImplementedError('New CIDER does not support spin polarization')
+        if self._density is None:
+            raise RuntimeError('New CIDER requires set_density before calculate')
+        if taut_sr is None:
+            raise ValueError('New CIDER requires tau including pseudo core tau')
+        for desc in (nt_sr.desc, taut_sr.desc):
+            if desc.comm.size != 1 or any(not np.array_equal(getattr(desc, key),
+                        getattr(self.grid, key)) for key in ('cell_cv', 'size_c', 'pbc_c')):
+                raise NotImplementedError('New CIDER does not support grid/cell changes')
+        if taut_sr.dims != (1,):
+            raise NotImplementedError('New CIDER does not support spin polarization')
+        xp = nt_sr.xp
+        n = nt_sr.to_xp(np)
+        tau = taut_sr.to_xp(np)
+        engine = self.engine
+        engine.dens.nt_sg = n.data
+        e, rho, dedrho = engine._get_cider_inputs(n.data, tau.data)
+        engine.calc_cider(e, rho, dedrho)
+        # In this phase the FFT and GPAW grids have identical serial layouts.
+        v = n.new(zeroed=True)
+        d = n.new(zeroed=True)
+        v.data[:] = dedrho[:, 0]
+        add_gradient_correction(engine.grad_v, dedrho, v.data)
+        d.data[:] = dedrho[:, 4]
+        self._paw_ready = True
+        return float(engine.gd.integrate(e)), v.to_xp(xp), d.to_xp(xp)
+
+    def calculate_paw_correction(self, setup, D_sp, dH_sp=None, a=None):
+        if not self._paw_ready:
+            raise RuntimeError('New CIDER PAW correction requires current grid XC')
+        engine = self.engine
+        if a not in engine.dens.D_asp or setup is not self.setups[a]:
+            raise ValueError('New CIDER PAW atom/setup mismatch')
+        if not np.array_equal(D_sp, engine.dens.D_asp[a]):
+            raise ValueError('New CIDER PAW density differs from grid evaluation')
+        if dH_sp is not None:
+            dH_sp += engine.dH_asp_tmp[a]
+        return float(engine.E_a_tmp[a])
+
+    def validate_force_calculation(self):
+        raise NotImplementedError('New CIDER forces are not implemented')
+
+    def add_forces(self, *args, **kwargs):
+        self.validate_force_calculation()
+
+    def stress_contribution(self, *args, **kwargs):
+        raise NotImplementedError('New CIDER stress is not implemented')
