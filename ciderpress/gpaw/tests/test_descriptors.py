@@ -25,13 +25,14 @@ from ase.build import bulk
 from ase.dft.bandgap import bandgap
 from ase.parallel import parprint
 from ase.units import Ha
-from gpaw import GPAW, PW, Mixer
+from gpaw import PW, Mixer
 from gpaw.mpi import world
 from gpaw.xc import XC
 from gpaw.xc.libxc import LibXC
 from numpy.testing import assert_allclose, assert_almost_equal
 from pyscf.dft.numint import NumInt
 
+from ciderpress.gpaw._gpaw_compat import GPAW
 from ciderpress.gpaw.calculator import get_cider_functional
 from ciderpress.gpaw.descriptors import (
     get_descriptors,

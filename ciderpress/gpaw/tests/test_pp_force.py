@@ -22,8 +22,9 @@ import unittest
 
 import numpy as np
 from ase import Atoms
-from gpaw import GPAW, PW, FermiDirac, Mixer
+from gpaw import PW, FermiDirac, Mixer
 
+from ciderpress.gpaw._gpaw_compat import GPAW
 from ciderpress.gpaw.calculator import get_cider_functional
 from ciderpress.gpaw.tests import equal
 

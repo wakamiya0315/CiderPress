@@ -23,8 +23,9 @@ import unittest
 import numpy as np
 from ase.build import bulk
 from ase.parallel import parprint
-from gpaw import GPAW, PW, Mixer
+from gpaw import PW, Mixer
 
+from ciderpress.gpaw._gpaw_compat import GPAW
 from ciderpress.gpaw.calculator import get_cider_functional
 
 USE_STORED_REF = True

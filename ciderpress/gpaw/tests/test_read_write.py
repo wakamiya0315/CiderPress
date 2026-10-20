@@ -23,11 +23,12 @@ import unittest
 import numpy as np
 from ase.build import bulk
 from ase.parallel import parprint
-from gpaw import GPAW, PW, Mixer, restart
+from gpaw import PW, Mixer, restart
 from gpaw.mpi import world
 from gpaw.xc.libxc import LibXC
 from numpy.testing import assert_almost_equal, assert_equal
 
+from ciderpress.gpaw._gpaw_compat import GPAW
 from ciderpress.gpaw.calculator import (
     CiderGPAW,
     DiffGGA,

@@ -26,9 +26,9 @@ try:
     from gpaw import cgpaw
 except ImportError:
     import _gpaw as cgpaw
-from gpaw.grid_descriptor import GridDescriptor
 from gpaw.xc.libvdwxc import FFTDistribution, nulltimer
 
+from ciderpress.gpaw._gpaw_compat import GridDescriptor, get_gpaw_comm
 from ciderpress.lib import c_null_ptr, load_library
 
 pwutil = load_library("libpwutil")
@@ -173,7 +173,7 @@ class LibCiderPW:
             comm = self.comm
             pwutil.ciderpw_init_mpi_from_gpaw(
                 self._ptr,
-                ctypes.py_object(comm.get_c_object()),
+                ctypes.py_object(get_gpaw_comm(comm)),
                 ctypes.c_int(self.nalpha),
                 ctypes.c_int(self.nbeta),
                 self.norms_ab.ctypes.data_as(ctypes.c_void_p),

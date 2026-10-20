@@ -19,7 +19,6 @@
 #
 
 import yaml
-from gpaw.calculator import GPAW
 from gpaw.xc.libxc import LibXC
 
 from ciderpress.dft.model_utils import (
@@ -28,6 +27,7 @@ from ciderpress.dft.model_utils import (
     load_cider_model,
     validate_cider_composition,
 )
+from ciderpress.gpaw._gpaw_compat import GPAW
 from ciderpress.gpaw.cider_fft import CiderGGA, CiderMGGA
 from ciderpress.gpaw.cider_kernel import CiderGGAHybridKernel, CiderMGGAHybridKernel
 from ciderpress.gpaw.cider_paw import CiderGGAPASDW, CiderMGGAPASDW

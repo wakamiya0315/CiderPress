@@ -22,9 +22,9 @@ import unittest
 
 import numpy as np
 from gpaw.mpi import MPIComm, world
-from gpaw.pw.descriptor import PWDescriptor
 from numpy.testing import assert_allclose
 
+from ciderpress.gpaw._gpaw_compat import PWDescriptor
 from ciderpress.gpaw.nldf_interface import GridDescriptor, LibCiderPW, wrap_fft_mpi
 
 

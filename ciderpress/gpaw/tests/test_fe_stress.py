@@ -23,9 +23,10 @@ import unittest
 import numpy as np
 from ase.build import bulk
 from ase.parallel import parprint
-from gpaw import GPAW, PW, FermiDirac
+from gpaw import PW, FermiDirac
 from gpaw.mpi import world
 
+from ciderpress.gpaw._gpaw_compat import GPAW
 from ciderpress.gpaw.calculator import get_cider_functional
 
 USE_STORED_REF = True

@@ -24,6 +24,7 @@ import numpy as np
 from gpaw.xc.gga import GGA
 from gpaw.xc.mgga import MGGA
 
+from ciderpress.gpaw._gpaw_compat import get_gpaw_comm
 from ciderpress.gpaw.atom_utils import FastAtomPASDWSlice, FastPASDWCiderKernel
 from ciderpress.gpaw.cider_fft import (
     CIDERPW_GRAD_MODE_FORCE,
@@ -174,7 +175,7 @@ class CiderPASDW_MPRoutines:
             rsizes = np.asarray(rsizes, order="C", dtype=np.int32)
             rlocs = np.asarray(rlocs, order="C", dtype=np.int32)
             libpwutil.ciderpw_all_gatherv_from_gpaw(
-                ctypes.py_object(comm.get_c_object()),
+                ctypes.py_object(get_gpaw_comm(comm)),
                 sendbuf.ctypes.data_as(ctypes.c_void_p),
                 ctypes.c_int(rtot),
                 recvbuf.ctypes.data_as(ctypes.c_void_p),

@@ -22,7 +22,6 @@ import numpy as np
 from ase.dft.bandgap import bandgap
 from ase.units import Bohr, Ha
 from gpaw.occupations import FixedOccupationNumbers, OccupationNumberCalculator
-from gpaw.pw.density import ReciprocalSpaceDensity
 from gpaw.sphere.lebedev import Y_nL, weight_n
 
 from ciderpress.dft.plans import SemilocalPlan
@@ -33,6 +32,7 @@ from ciderpress.dft.settings import (
     SDMXBaseSettings,
     SemilocalSettings,
 )
+from ciderpress.gpaw._gpaw_compat import ReciprocalSpaceDensity
 from ciderpress.gpaw.atom_descriptor_utils import (
     PASDWCiderFeatureKernel,
     calculate_paw_sl_features,

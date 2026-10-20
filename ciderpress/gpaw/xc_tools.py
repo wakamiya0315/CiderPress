@@ -23,12 +23,12 @@ from pathlib import Path
 import numpy as np
 from ase.units import Ha
 from gpaw import GPAW
-from gpaw.calculator import GPAW as GPAWOld
 from gpaw.new.ase_interface import ASECalculator
 from gpaw.utilities import unpack_hermitian
 from gpaw.xc import XC
 from gpaw.xc.kernel import XCNull
 
+from ciderpress.gpaw._gpaw_compat import GPAW as GPAWOld
 from ciderpress.gpaw.cider_paw import CiderPASDW_MPRoutines
 
 
