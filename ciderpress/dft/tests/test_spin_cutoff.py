@@ -2,8 +2,11 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from ciderpress.dft.xc_evaluator2 import MappedDFTKernel2
+from ciderpress.dft.plans import NLDFSplinePlan
+from ciderpress.dft.settings import NLDFSettingsVJ
 
 
 def linear_separate_kernel():
@@ -50,3 +53,22 @@ def test_one_inactive_spin_and_spin_exchange():
     np.testing.assert_array_equal(derivative, [[0., 1.], [1., 0.]])
     np.testing.assert_array_equal(energy, swapped_energy)
     np.testing.assert_array_equal(derivative, swapped_derivative[::-1])
+
+
+@pytest.mark.parametrize('nspin', [1, 2])
+def test_plan_copy_preserves_density_gate(nspin):
+    settings = NLDFSettingsVJ('MGGA', [1., 0., .03125], 'one',
+                              ['se'], [[1., 0., .03125]])
+    plan = NLDFSplinePlan(settings, nspin, .01, 1.8, 12, rhocut=1e-8)
+    copied = plan.new()
+    twice = copied.new()
+    assert copied.rhocut == twice.rhocut == plan.rhocut
+    rho = np.array([.25e-8, .75e-8, 1.5e-8]) / nspin
+    inputs = (rho, np.zeros_like(rho), rho ** (5 / 3))
+    function, derivatives = plan.get_function_to_convolve(inputs)
+    for candidate in (copied, twice):
+        actual, gradient = candidate.get_function_to_convolve(inputs)
+        np.testing.assert_array_equal(actual, function)
+        np.testing.assert_array_equal(gradient, derivatives)
+    switched = plan.new(nspin=3-nspin)
+    assert switched.rhocut * switched.nspin == plan.rhocut * plan.nspin

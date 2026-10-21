@@ -1687,7 +1687,7 @@ class NLDFAuxiliaryPlan(ABC):
             coef_order=self.coef_order,
             alpha_formula=self.alpha_formula,
             proc_inds=self.proc_inds,
-            rhocut=self.rhocut,
+            rhocut=self.rhocut * self.nspin,
             expcut=self.expcut,
         )
         new_kwargs.update(kwargs)
