@@ -25,9 +25,9 @@ def test_tau_provider_trajectory(tmp_path, monkeypatch):
         mixer = dict(beta=.03, nmaxold=5, weight=100)
         if method != 'native':
             mixer['tau'] = dict(method=method, beta=1.)
-        xc = get_cider_functional('CIDER26XCSURFSCI', xmix=1.,
-                                 xkernel=None, ckernel=None,
-                                 pasdw_store_funcs=False)
+        xc = get_cider_functional(
+            'CIDER26XCSURFSCI', xmix=1., xkernel=None, ckernel=None,
+            pasdw_store_funcs=False)
         calc = CiderGPAW('seed.gpw', xc=xc, mixer=mixer,
                          convergence={'minimum iterations': 4},
                          maxiter=4, txt=None)
@@ -49,10 +49,10 @@ def test_tau_provider_trajectory(tmp_path, monkeypatch):
                     for _ in range(2):
                         calc.hamiltonian.xc.calculate(calc.density.finegd,
                                                       calc.density.nt_sg)
-                    for a,b in zip(before, [state.tau_in,state.tau_out]):
-                        np.testing.assert_array_equal(a,b)
-                    for a,b in zip(history,state.tau_history):
-                        np.testing.assert_array_equal(a,b)
+                    for a, b in zip(before, [state.tau_in, state.tau_out]):
+                        np.testing.assert_array_equal(a, b)
+                    for a, b in zip(history, state.tau_history):
+                        np.testing.assert_array_equal(a, b)
             trace.append(row)
 
         calc.attach(observe, 1)
@@ -66,7 +66,8 @@ def test_tau_provider_trajectory(tmp_path, monkeypatch):
     assert all(len(path) == 4 for path in paths)
     for rows in zip(*paths):
         for row in rows[1:]:
-            np.testing.assert_allclose(row['energy'], rows[0]['energy'], atol=1e-11, rtol=0)
+            np.testing.assert_allclose(
+                row['energy'], rows[0]['energy'], atol=1e-11, rtol=0)
             np.testing.assert_array_equal(row['n'], rows[0]['n'])
         for row in rows[2:]:
             for key in ('tin', 'tout', 'nout'):
