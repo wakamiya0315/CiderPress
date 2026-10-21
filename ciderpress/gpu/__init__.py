@@ -15,6 +15,8 @@ _device = None
 
 
 def _real_cupy():
+    if os.environ.get("GPAW_CPUPY"):
+        return None
     try:
         import cupy
     except ImportError:

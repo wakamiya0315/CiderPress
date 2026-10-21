@@ -29,6 +29,7 @@ from interpolation.splines.eval_cubic_numba import (
     vec_eval_cubic_splines_G_4,
 )
 
+from ciderpress.gpu import use_gpu
 from ciderpress.lib import load_library
 from ciderpress.models.kernels import (
     DiffConstantKernel,
@@ -330,6 +331,12 @@ class RBFEvaluator(FuncEvaluator, XCEvalSerializable):
         n = X1.shape[-2]
         for arr in [res, dres, X1]:
             assert arr.flags.c_contiguous
+        # SEP/NPOL in CIDER26XCSURFSCI both use the ordinary evaluator.
+        # Other evaluator variants keep their existing C implementation.
+        if type(self) is RBFEvaluator and use_gpu("rbf"):
+            from ciderpress.gpu.rbf import evaluate
+
+            return evaluate(self, X1, res, dres)
         self._fn(
             res.ctypes.data_as(ctypes.c_void_p),
             dres.ctypes.data_as(ctypes.c_void_p),
