@@ -1,4 +1,4 @@
-"""CPU CIDER26XCSURFSCI for New GPAW PW, with redundant k-point XC.
+"""CPU-engine CIDER26XCSURFSCI for New GPAW CPU/GPU PW.
 
 Term                       Counted by
 =========================  ================================================
@@ -19,6 +19,7 @@ from copy import copy
 from functools import lru_cache
 from importlib.resources import files
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 
 import numpy as np
@@ -67,7 +68,7 @@ def _process_comm():
 
 
 class CiderXC(XC):
-    """Serializable, fail-closed New-GPAW XC parameter (CPU PW only).
+    """Serializable, fail-closed New-GPAW XC parameter (PW only).
 
     Use ``GPAW(..., xc=CiderXC(), legacy_gpaw=False)`` and restore GPWs with
     ``object_hooks={'xc': restore_cider_xc}``. Both the requested interpolation
@@ -213,11 +214,11 @@ class CiderNewMGGAFunctional(MGGAFunctional):
     ``to_xp(np)`` before entering the Classic numpy numerical engine.
     """
 
-    def __init__(self, param, grid, xp=np, *, _allow_fake_gpu=False):
+    def __init__(self, param, grid, xp=np):
         if xp is not np:
-            from gpaw.gpu import cupy, cupy_is_fake
-            if not (_allow_fake_gpu and cupy_is_fake and xp is cupy):
-                raise NotImplementedError('New CIDER Phase 2 supports CPU numpy only')
+            from gpaw.gpu import cupy
+            if xp is not cupy:
+                raise NotImplementedError('New CIDER supports numpy or GPAW cupy only')
         if grid.comm.size != 1:
             raise NotImplementedError('New CIDER does not support domain parallelism')
         old = MGGA(LibXC('PBE'), stencil=2)
@@ -233,6 +234,29 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         self.setups = None
         self._density = None
         self._paw_ready = False
+        # One record per boundary operation, including zero-cost numpy no-ops.
+        # Synchronization excludes preceding device work from copy timings.
+        self.transfer_timings = []
+
+    def _transfer(self, array, xp, label):
+        source = getattr(array, 'xp', None)
+        if source is None:
+            source = array.layout.xp  # AtomArrays
+        if source is xp:
+            result, seconds = array, 0.0
+        else:
+            from gpaw.gpu import cupy, cupy_is_fake
+            if not cupy_is_fake:
+                cupy.cuda.get_current_stream().synchronize()
+            start = perf_counter()
+            result = array.to_xp(xp)
+            if not cupy_is_fake:
+                cupy.cuda.get_current_stream().synchronize()
+            seconds = perf_counter() - start
+        self.transfer_timings.append(dict(operation=label, seconds=seconds,
+            bytes=int(array.data.size * array.data.dtype.itemsize),
+            copied=source is not xp))
+        return result
 
     def set_context(self, *, setups, relpos_ac, atomdist,
                     communicators=None, mode='pw', distribute_density=False):
@@ -279,7 +303,7 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         engine = self.engine
         if engine.setups is None:
             raise RuntimeError('New CIDER requires set_context before set_density')
-        matrices = density.D_asii.to_xp(np)
+        matrices = self._transfer(density.D_asii, np, 'D_to_host')
         if (matrices.layout.atomdist.comm.size != 1 or
                 not np.array_equal(matrices.layout.atomdist.rank_a,
                                    engine.atom_partition.rank_a)):
@@ -308,8 +332,8 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         if taut_sr.dims != (1,):
             raise NotImplementedError('New CIDER does not support spin polarization')
         xp = nt_sr.xp
-        n = nt_sr.to_xp(np)
-        tau = taut_sr.to_xp(np)
+        n = self._transfer(nt_sr, np, 'n_to_host')
+        tau = self._transfer(taut_sr, np, 'tau_to_host')
         engine = self.engine
         engine.dens.nt_sg = n.data
         e, rho, dedrho = engine._get_cider_inputs(n.data, tau.data)
@@ -321,7 +345,9 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         add_gradient_correction(engine.grad_v, dedrho, v.data)
         d.data[:] = dedrho[:, 4]
         self._paw_ready = True
-        return float(engine.gd.integrate(e)), v.to_xp(xp), d.to_xp(xp)
+        return (float(engine.gd.integrate(e)),
+                self._transfer(v, xp, 'v_to_device'),
+                self._transfer(d, xp, 'dedtau_to_device'))
 
     def calculate_paw_correction(self, setup, D_sp, dH_sp=None, a=None):
         if not self._paw_ready:
