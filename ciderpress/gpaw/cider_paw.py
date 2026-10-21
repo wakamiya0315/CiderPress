@@ -723,6 +723,11 @@ class CiderMGGAPASDW(CiderPASDW_MPRoutines, CiderMGGA):
 
         stress_vv = 0.5 * (stress_vv + stress_vv.T)
 
+        from gpaw.xc.gga import stress_gradient_stencil_term
+
+        stress_vv += stress_gradient_stencil_term(
+            self.gd, self.grad_v, n_sg, rho_sxg[:, 1:4], dedrho_sxg[:, 1:4])
+
         self.gd.comm.sum(stress_vv)
 
         stress_vv += stress1_vv
