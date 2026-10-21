@@ -749,6 +749,12 @@ class PAWCiderContribsRecip(_PAWCiderContribs):
         self._gnorms = gplan.alpha_norms.copy()
 
     def r2k(self, in_sxLq, rgd, fwd=True):
+        from ciderpress.gpu import use_gpu
+
+        if use_gpu("pasdw"):
+            from ciderpress.gpu.pasdw import r2k
+
+            return r2k(self, in_sxLq, rgd, fwd)
         # TODO need to work out atco in and out
         # when nldf is not vj
         if fwd:
@@ -857,6 +863,14 @@ class PAWCiderContribsRecip(_PAWCiderContribs):
         return out_skLq
 
     def calc_conv_skLq(self, in_skLq, rgd, alphas=None, alpha_norms=None):
+        from ciderpress.gpu import use_gpu
+
+        if use_gpu("pasdw"):
+            from ciderpress.gpu.pasdw import reciprocal_convolution
+
+            if alphas is None:
+                alphas, alpha_norms = self.plan.alphas, self.plan.alpha_norms
+            return reciprocal_convolution(self, in_skLq, rgd, alphas, alpha_norms)
         in_skLq = np.ascontiguousarray(in_skLq)
         out_skLq = np.empty_like(in_skLq)
         k_g = np.ascontiguousarray(rgd.k_g)
@@ -1127,6 +1141,33 @@ class CiderRadialExpansion:
             "potential",
         ]
 
+    def _contract_gradient(self, rgd, n_qg, dndr_qg, dedn_sg, dedgrad_svg, Lmax):
+        from ciderpress.gpu import use_gpu
+
+        if use_gpu("pasdw"):
+            from ciderpress.gpu.pasdw import contract_gradient
+
+            return contract_gradient(self.rcalc.xc, rgd, n_qg, dndr_qg,
+                                     dedn_sg, dedgrad_svg, Lmax)
+        nspins = len(dedn_sg)
+        nn = Y_nL.shape[0]
+        dedn_sgn = dedn_sg.reshape(nspins, -1, nn)
+        dedgrad_svgn = dedgrad_svg.reshape(nspins, 3, -1, nn)
+        dedgrad_sgn = np.einsum("svgn,nv->sgn", dedgrad_svgn, R_nv)
+        dEdD_sqn = np.einsum("qg,sgn->sqn", n_qg * rgd.dv_g, dedn_sgn)
+        dEdD_sqn += np.einsum("qg,sgn->sqn", dndr_qg * rgd.dv_g, dedgrad_sgn)
+        dEdD_sqL = np.einsum(
+            "sqn,nL->sqL", dEdD_sqn, weight_n[:, None] * Y_nL[:, :Lmax]
+        )
+        tmp = rgd.dr_g * rgd.r_g
+        B_svqn = np.einsum("qg,svgn->svqn", n_qg * tmp, dedgrad_svgn)
+        dEdD_sqL += np.einsum(
+            "nLv,svqn->sqL",
+            (4 * np.pi) * weight_n[:, None, None] * rnablaY_nLv[:, :Lmax],
+            B_svqn,
+        )
+        return dEdD_sqL
+
     def __call__(self, rgd, D_sLq, n_qg, dndr_qg, nc0_sg, dnc0dr_sg, ae=True):
         n_sLg = np.dot(D_sLq, n_qg)
         n_sLg[:, 0] += nc0_sg
@@ -1166,20 +1207,8 @@ class CiderRadialExpansion:
             )
             nn = Y_nL.shape[0]
             nq = f_srLq.shape[-1]
-            dedn_sgn = dedn_sg.reshape(nspins, -1, nn)
-            dedgrad_svgn = dedgrad_svg.reshape(nspins, 3, -1, nn)
-            dedgrad_sgn = np.einsum("svgn,nv->sgn", dedgrad_svgn, R_nv)
-            dEdD_sqn = np.einsum("qg,sgn->sqn", n_qg * rgd.dv_g, dedn_sgn)
-            dEdD_sqn += np.einsum("qg,sgn->sqn", dndr_qg * rgd.dv_g, dedgrad_sgn)
-            dEdD_sqL = np.einsum(
-                "sqn,nL->sqL", dEdD_sqn, weight_n[:, None] * Y_nL[:, :Lmax]
-            )
-            tmp = rgd.dr_g * rgd.r_g
-            B_svqn = np.einsum("qg,svgn->svqn", n_qg * tmp, dedgrad_svgn)
-            dEdD_sqL += np.einsum(
-                "nLv,svqn->sqL",
-                (4 * np.pi) * weight_n[:, None, None] * rnablaY_nLv[:, :Lmax],
-                B_svqn,
+            dEdD_sqL = self._contract_gradient(
+                rgd, n_qg, dndr_qg, dedn_sg, dedgrad_svg, Lmax
             )
             E = rgd.integrate(e_g.reshape(-1, nn).dot(weight_n))
             return E, dEdD_sqL, vf_srLq
@@ -1196,20 +1225,8 @@ class CiderRadialExpansion:
             )
             nn = Y_nL.shape[0]
             nq = f_srLq.shape[-1]
-            dedn_sgn = dedn_sg.reshape(nspins, -1, nn)
-            dedgrad_svgn = dedgrad_svg.reshape(nspins, 3, -1, nn)
-            dedgrad_sgn = np.einsum("svgn,nv->sgn", dedgrad_svgn, R_nv)
-            dEdD_sqn = np.einsum("qg,sgn->sqn", n_qg * rgd.dv_g, dedn_sgn)
-            dEdD_sqn += np.einsum("qg,sgn->sqn", dndr_qg * rgd.dv_g, dedgrad_sgn)
-            dEdD_sqL = np.einsum(
-                "sqn,nL->sqL", dEdD_sqn, weight_n[:, None] * Y_nL[:, :Lmax]
-            )
-            tmp = rgd.dr_g * rgd.r_g
-            B_svqn = np.einsum("qg,svgn->svqn", n_qg * tmp, dedgrad_svgn)
-            dEdD_sqL += np.einsum(
-                "nLv,svqn->sqL",
-                (4 * np.pi) * weight_n[:, None, None] * rnablaY_nLv[:, :Lmax],
-                B_svqn,
+            dEdD_sqL = self._contract_gradient(
+                rgd, n_qg, dndr_qg, dedn_sg, dedgrad_svg, Lmax
             )
             return dEdD_sqL
 
@@ -1606,6 +1623,12 @@ class FastPASDWCiderKernel:
             D_asiq: Atomic PAW PASDW projections
             vc_asiq: functional derivatives with respect to coefficients c_sabi
         """
+        from ciderpress.gpu import use_gpu
+
+        if use_gpu("pasdw") and not USE_GAUSSIAN_PAW_CONV:
+            from ciderpress.gpu.pasdw import calculate_corrections
+
+            return calculate_corrections(self, setups, D_asp, D_asiq, vc_asiq)
         if D_asiq is None and vc_asiq is None:
             return self.calculate_paw_cider_features(setups, D_asp)
         elif D_asiq is not None:
@@ -1997,6 +2020,13 @@ class RadialFunctionCollection:
         else:
             assert p_rlmq.shape == (ngrid, self.nlm, nalpha)
             assert p_rlmq.flags.c_contiguous
+        from ciderpress.gpu import use_gpu
+
+        if use_gpu("pasdw"):
+            from ciderpress.gpu.pasdw import numeric_basis
+
+            numeric_basis(self, p_uq, p_rlmq, fwd)
+            return
         iloc_l = np.asarray(self.iloc_l, dtype=np.int32, order="C")
         uloc_l = np.asarray(self.uloc_l, dtype=np.int32, order="C")
         if fwd:
@@ -2023,6 +2053,13 @@ class RadialFunctionCollection:
         ngrid = self.funcs_ig.shape[1]
         if p_srlmq is None:
             p_srlmq = np.zeros((nspin, ngrid, self.nlm, nalpha))
+        from ciderpress.gpu import use_gpu
+
+        if use_gpu("pasdw"):
+            from ciderpress.gpu.pasdw import numeric_basis
+
+            numeric_basis(self, p_suq, p_srlmq, True)
+            return p_srlmq
         for s in range(nspin):
             self.basis2grid(p_suq[s], p_srlmq[s], fwd=True)
         return p_srlmq
@@ -2036,6 +2073,13 @@ class RadialFunctionCollection:
         assert p_srlmq.shape[2] == self.nlm
         if p_suq is None:
             p_suq = np.zeros((nspin, self.nu, nalpha))
+        from ciderpress.gpu import use_gpu
+
+        if use_gpu("pasdw"):
+            from ciderpress.gpu.pasdw import numeric_basis
+
+            numeric_basis(self, p_suq, p_srlmq, False)
+            return p_suq
         for s in range(nspin):
             self.basis2grid(p_suq[s], p_srlmq[s], fwd=False)
         return p_suq
@@ -2129,6 +2173,15 @@ class _PSmoothSetupBase(PASDWData):
         return get_delta_lpg(betas_lv, self.rcut_feat, rgd, pmin, pmax + 1e-8)
 
     def k2orb(self, f_skLq):
+        from ciderpress.gpu import use_gpu
+
+        if use_gpu("pasdw"):
+            from ciderpress.gpu.pasdw import radial, solve
+
+            x = f_skLq * get_dvk(self.sbt_rgd)[:, None, None]
+            p = radial(self, self.pcol.atco_recip, self.sbt_rgd.k_g,
+                       x.shape[-2], x, True)
+            return solve(self.pcol.atco, p)
         f_skLq = f_skLq * get_dvk(self.sbt_rgd)[:, None, None]
         if not f_skLq.flags.c_contiguous:
             f_skLq = np.ascontiguousarray(f_skLq)
@@ -2157,6 +2210,15 @@ class _PSmoothSetupBase(PASDWData):
         return out_suq
 
     def orb2k(self, f_suq):
+        from ciderpress.gpu import use_gpu
+
+        if use_gpu("pasdw"):
+            from ciderpress.gpu.pasdw import radial, solve
+
+            f_suq = np.ascontiguousarray(f_suq)
+            solve(self.pcol.atco, f_suq)
+            return radial(self, self.pcol.atco_recip, self.sbt_rgd.k_g,
+                          self._grid_nlm, f_suq, False)
         if not f_suq.flags.c_contiguous:
             f_suq = np.ascontiguousarray(f_suq)
         nspin, nu, nq = f_suq.shape
@@ -2206,6 +2268,12 @@ class _PSmoothSetupBase(PASDWData):
         return vy_svq
 
     def coef_to_real(self, c_siq, out=None, check_q=True, use_ffuncs=False):
+        from ciderpress.gpu import use_gpu
+
+        if use_gpu("pasdw"):
+            from ciderpress.gpu.pasdw import coefficients
+
+            return coefficients(self, c_siq, out, True, check_q, use_ffuncs)
         if check_q:
             nq = self.alphas.size
         else:
@@ -2233,6 +2301,12 @@ class _PSmoothSetupBase(PASDWData):
         return xt_sgLq
 
     def real_to_coef(self, xt_sgLq, out=None, check_q=True, use_ffuncs=False):
+        from ciderpress.gpu import use_gpu
+
+        if use_gpu("pasdw"):
+            from ciderpress.gpu.pasdw import coefficients
+
+            return coefficients(self, xt_sgLq, out, False, check_q, use_ffuncs)
         if check_q:
             nq = self.alphas.size
         else:
