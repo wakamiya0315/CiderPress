@@ -244,6 +244,9 @@ class MappedDFTKernel2(KernelEvalBase2, XCEvalSerializable):
         if rhocut > 0:
             cond = rho_tuple[0] < rhocut
             if self.mode == "SEP":
+                # Separate-spin descriptors use the spin-scaled density.
+                # Use that same representation for the numerical cutoff.
+                cond = rho_tuple[0].shape[0] * rho_tuple[0] < rhocut
                 f[cond] = 0.0
                 df[cond] = 0.0
             else:
