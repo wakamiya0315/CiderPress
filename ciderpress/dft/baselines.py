@@ -23,6 +23,7 @@ import ctypes
 import numpy as np
 
 from ciderpress.dft.settings import LDA_FACTOR
+from ciderpress.gpu import use_gpu
 from ciderpress.lib import load_library
 
 xc_helper = load_library("libxc_utils")
@@ -135,6 +136,10 @@ def gga_x_pbe(X0T):
 def get_libxc_lda_baseline(xcid, rho):
     if isinstance(xcid, str):
         xcid = LDA_CODES[xcid]
+    if xcid == 1 and use_gpu("libxc"):
+        from ciderpress.gpu.libxc import evaluate
+
+        return evaluate(xcid, rho)
     nspin, size = rho.shape
     rho = np.asfortranarray(rho)
     exc = np.zeros(size)
@@ -186,6 +191,10 @@ def get_libxc_lda_rs_baseline(xcid, rho, omega=0.0):
 def get_libxc_gga_baseline(xcid, rho, sigma):
     if isinstance(xcid, str):
         xcid = GGA_CODES[xcid]
+    if xcid in (101, 130) and use_gpu("libxc"):
+        from ciderpress.gpu.libxc import evaluate
+
+        return evaluate(xcid, rho, sigma)
     nspin, size = rho.shape
     assert sigma.shape == (2 * nspin - 1, size)
     rho = np.asfortranarray(rho)

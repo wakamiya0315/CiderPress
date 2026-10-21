@@ -22,6 +22,7 @@ import numpy as np
 
 from ciderpress.dft.baselines import get_libxc_baseline
 from ciderpress.dft.xc_evaluator import FuncEvaluator, XCEvalSerializable
+from ciderpress.gpu import use_gpu
 
 
 class KernelEvalBase2:
@@ -304,6 +305,11 @@ class MappedXC2:
             res, dres (array, array), XC energy contribution
                 and functional derivative
         """
+        if use_gpu("semilocal") and use_gpu("rbf") and use_gpu("libxc"):
+            from ciderpress.gpu.semilocal import evaluate, supported
+
+            if X0T.shape[0] in (1, 2) and X0T.dtype == np.float64 and supported(self):
+                return evaluate(self, X0T, rho_tuple, rhocut)
         vrho_tuple = tuple([np.zeros_like(r, order="F") for r in rho_tuple])
         res, dres = 0, 0
         for kernel in self.kernels:
