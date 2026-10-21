@@ -129,6 +129,27 @@ def _signature(*arrays):
     return tuple((a.shape, a.dtype.str, sha256(a.tobytes()).digest()) for a in arrays)
 
 
+def _table_revision(owner, name, *arrays):
+    """Exact byte comparisons for large FP64 tables, avoiding repeated SHA.
+
+    A private host snapshot costs one additional setup-table copy. Every
+    element is checked on reuse, including signed zero and NaN payload bits.
+    Replacing an array with identical contents needs no device rebuild.
+    """
+    assert all(a.dtype == np.float64 for a in arrays)
+    metadata = tuple((a.shape, a.dtype.str) for a in arrays)
+    cache = getattr(owner, '_pasdw_host_table_cache', None)
+    if cache is None:
+        cache = owner._pasdw_host_table_cache = {}
+    previous = cache.get(name)
+    if previous is not None and previous[0] == metadata:
+        if all(np.array_equal(a.view(np.uint64), b) for a, b in zip(arrays, previous[1])):
+            return previous[2]
+    revision = 1 if previous is None else previous[2]+1
+    cache[name] = metadata, tuple(a.copy(order='C').view(np.uint64) for a in arrays), revision
+    return revision
+
+
 def _cached(owner, name, signature, build):
     cp = cupy()
     # Device selection and CPU table contents are part of every cache key.
@@ -151,6 +172,21 @@ def _launch(name, size, args):
         _kernel(name)(((size + 255) // 256,), (256,), args)
 
 
+def _device_array(x):
+    cp = cupy()
+    return cp.ascontiguousarray(x) if isinstance(x, cp.ndarray) else cp.asarray(np.ascontiguousarray(x))
+
+
+def _join_device(values, stack=True):
+    """Accept legacy/replay host states and resident states from this cycle."""
+    cp = cupy()
+    if any(isinstance(x, cp.ndarray) for x in values):
+        fn = cp.stack if stack else cp.concatenate
+        return fn([cp.asarray(x) for x in values])
+    fn = np.stack if stack else np.concatenate
+    return cp.asarray(fn(values))
+
+
 def _tables(cp, table, ls, nlm):
     nbas = len(ls)
     ao = np.r_[0, np.cumsum(2 * ls + 1)].astype(np.int32)
@@ -171,7 +207,8 @@ def _contract(tables, x, ns, nr, nlm, nu, nq, to_orb, initial=None):
     cp = cupy()
     assert x.dtype == np.float64
     table, shell, lm, start, end, ao = tables
-    dx = cp.asarray(np.ascontiguousarray(x))
+    device = isinstance(x, cp.ndarray)
+    dx = _device_array(x)
     shape = (ns, nu, nq) if to_orb else (ns, nr, nlm, nq)
     out = cp.zeros(shape, dtype=cp.float64) if initial is None else cp.array(initial)
     ints = tuple(np.int32(i) for i in (ns, nr, nlm, nu, nq))
@@ -179,7 +216,7 @@ def _contract(tables, x, ns, nr, nlm, nu, nq, to_orb, initial=None):
         _launch('rad2orb', out.size, (dx, table, shell, lm, out, *ints))
     else:
         _launch('orb2rad', out.size, (dx, table, start, end, ao, out, *ints))
-    return cp.asnumpy(out)
+    return out if device else cp.asnumpy(out)
 
 
 def radial(owner, atco, r, nlm, x, to_orb):
@@ -225,10 +262,11 @@ def numeric_basis(owner, p_uq, p_rlmq, fwd):
         p_uq[:] = out
 
 
-def coefficients(owner, x, out, to_radial, check_q=True, use_ffuncs=False):
+def coefficients(owner, x, out, to_radial, check_q=True, use_ffuncs=False, _nlm=None):
     """PASDW projectors, including additive output semantics."""
     cp = cupy()
-    nr, nlm, ni = owner.slrgd.r_g.size, owner.pcol.nlm, owner.ni
+    nr, ni = owner.slrgd.r_g.size, owner.ni
+    nlm = owner.pcol.nlm if _nlm is None else _nlm
     nq = owner.alphas.size if check_q else x.shape[-1]
     ns = len(x)
     table = (owner.ffuncs_jg[owner.jlist_i] if use_ffuncs else
@@ -244,9 +282,15 @@ def coefficients(owner, x, out, to_radial, check_q=True, use_ffuncs=False):
     else:
         assert out.shape == shape and out.dtype == np.float64
         dest = cp.array(out, order='C')
-    dx = cp.asarray(np.ascontiguousarray(x))
+    device = isinstance(x, cp.ndarray)
+    dx = _device_array(x)
     _launch('coef2rad' if to_radial else 'rad2coef', dest.size,
             (dx, *tables, dest, *(np.int32(i) for i in (ns, nr, nlm, ni, nq))))
+    if device:
+        if out is not None:
+            out[:] = dest
+            return out
+        return dest
     host = cp.asnumpy(dest)
     if out is not None:
         out[:] = host
@@ -287,6 +331,9 @@ def solve(atco, x):
     """Use the existing host factor/solve, without forming an inverse."""
     from ciderpress.dft.plans import libcider
 
+    cp = cupy()
+    if isinstance(x, cp.ndarray):
+        return cp.asarray(solve(atco, cp.asnumpy(x)))
     for s in range(len(x)):
         libcider.solve_atc_coefs_arr(atco.atco_c_ptr, _ptr(x[s]),
                                     ctypes.c_int(x.shape[-1]))
@@ -300,7 +347,7 @@ def r2k(owner, x, rgd, fwd):
               (rgd.k_g, owner.grids_indexer.rad_arr))
     nlm = x.shape[-2]
     p = radial(owner, ai, ri, nlm, x, True)
-    solve(owner.atco_inp, p)
+    p = solve(owner.atco_inp, p)
     return radial(owner, ao, ro, nlm, p, False)
 
 
@@ -316,12 +363,13 @@ def reciprocal_convolution(owner, x, rgd, alphas, norms):
         return cp.asarray(table)
     table = _cached(owner, ('convolution', len(alphas)), signature, build)
     cp = cupy()
-    dx = cp.asarray(np.ascontiguousarray(x))
+    device = isinstance(x, cp.ndarray)
+    dx = _device_array(x)
     out = cp.empty_like(dx)
     assert x.shape[1] == len(k) and x.shape[-1] == len(alphas)
     _launch('convolve', out.size, (dx, table, out,
             *(np.int32(i) for i in x.shape)))
-    return cp.asnumpy(out)
+    return out if device else cp.asnumpy(out)
 
 
 def _groups(setups, D):
@@ -350,10 +398,11 @@ class _BatchIndexer:
 
 
 class _BatchContribs:
-    def __init__(self, base, count):
+    def __init__(self, base, count, theta_cache=None):
         from ciderpress.gpu import use_gpu
 
         self.base = base
+        self.theta_cache = theta_cache
         self.grids_indexer = _BatchIndexer(base.grids_indexer, count)
         self.w_g = np.tile(base.w_g, count)
         self.plan = _DevicePlan(base.plan) if use_gpu('pasdw') else base.plan
@@ -361,46 +410,70 @@ class _BatchContribs:
     def __getattr__(self, name):
         return getattr(self.base, name)
 
-    def features(self, rho):
+    def features(self, rho, theta_index=None):
         from ciderpress.gpaw.atom_utils import _PAWCiderContribs
 
         if isinstance(self.plan, _DevicePlan) and self.plan._supported():
             plan = self.base.plan
-            out = np.stack([self.grids_indexer.empty_rlmq(plan.nalpha) for _ in rho])
+            from ciderpress.gpu.pasdw_reductions import spherical
+
+            out = []
+            theta = []
             for s in range(len(rho)):
                 rt = plan.get_rho_tuple(rho[s])
-                arg = plan.get_interpolation_arguments(rt, i=-1)[0]
-                fun = plan.get_function_to_convolve(rt)[0]
-                fun *= self.w_g
-                x = theta_grid(plan, arg, fun)
-                self.grids_indexer.reduce_angc_ylm_(out[s], x, a2y=True)
-            return out
+                arg, da = plan.get_interpolation_arguments(rt, i=-1)
+                fun, df = plan.get_function_to_convolve(rt)
+                theta.append((arg, da, fun, df))
+                x = theta_grid(plan, arg, fun*self.w_g, _device=True)
+                out.append(spherical(self.base.grids_indexer, x, True))
+            if self.theta_cache is not None and theta_index is not None:
+                self.theta_cache[theta_index] = theta
+            return cupy().stack(out)
         return _PAWCiderContribs.get_paw_atom_contribs(self, rho)
 
     def energy(self, e, rho, v, f):
         from ciderpress.gpaw.atom_utils import _PAWCiderContribs
 
-        return _PAWCiderContribs.get_paw_atom_contribs_en(self, e, rho, v, f)
+        if isinstance(self.plan, _DevicePlan) and self.plan._supported():
+            from ciderpress.gpu.pasdw_reductions import energy
 
-    def potential(self, rho, v, x):
+            return energy(self, e, rho, v, f)
+        if isinstance(f, cupy().ndarray):
+            f = cupy().asnumpy(f)
+        host_v = np.zeros_like(rho) if isinstance(v, cupy().ndarray) else v
+        result = _PAWCiderContribs.get_paw_atom_contribs_en(self, e, rho, host_v, f)
+        if host_v is not v:
+            v[:] = cupy().asarray(host_v)
+        return result
+
+    def potential(self, rho, v, x, theta_index=None):
         from ciderpress.gpaw.atom_utils import _PAWCiderContribs
 
         if isinstance(self.plan, _DevicePlan) and self.plan._supported():
+            from ciderpress.gpu.pasdw_reductions import spherical
+            from ciderpress.gpu.pasdw_exponents import theta_potential
+
             plan = self.base.plan
-            grid = self.grids_indexer.empty_gq(plan.nalpha)
             for s in range(len(rho)):
-                self.grids_indexer.reduce_angc_ylm_(x[s], grid, a2y=False)
-                rt = plan.get_rho_tuple(rho[s])
-                arg, da = plan.get_interpolation_arguments(rt, i=-1)
-                fun, df = plan.get_function_to_convolve(rt)
-                va, vf = theta_adjoint(plan, grid, arg, fun)
-                v[s, 0] += va*da[0] + vf*df[0]
-                tmp = va*da[1] + vf*df[1]
-                v[s, 1:4] += 2*rho[s, 1:4]*tmp
-                if len(da) == 3:
-                    v[s, 4] += va*da[2] + vf*df[2]
+                grid = spherical(self.base.grids_indexer, cupy().asarray(x[s]), False)
+                if self.theta_cache is not None and theta_index in self.theta_cache:
+                    arg, da, fun, df = self.theta_cache[theta_index][s]
+                else:
+                    rt = plan.get_rho_tuple(rho[s])
+                    arg, da = plan.get_interpolation_arguments(rt, i=-1)
+                    fun, df = plan.get_function_to_convolve(rt)
+                target = v[s] if isinstance(v, cupy().ndarray) else cupy().asarray(v[s])
+                theta_potential(plan, grid, rho[s], arg, fun, da, df, target)
+                if not isinstance(v, cupy().ndarray):
+                    v[s] = cupy().asnumpy(target)
             return
-        return _PAWCiderContribs.get_paw_atom_contribs_pot(self, rho, v, x)
+        if isinstance(x, cupy().ndarray):
+            x = cupy().asnumpy(x)
+        host_v = cupy().asnumpy(v) if isinstance(v, cupy().ndarray) else v
+        result = _PAWCiderContribs.get_paw_atom_contribs_pot(self, rho, host_v, x)
+        if host_v is not v:
+            v[:] = cupy().asarray(host_v)
+        return result
 
 
 def _theta_table(plan):
@@ -408,12 +481,12 @@ def _theta_table(plan):
     return _cached(plan, ('spline', -1), _signature(table), lambda cp: cp.asarray(table))
 
 
-def theta_grid(plan, arg, fun):
+def theta_grid(plan, arg, fun, _device=False):
     cp = cupy()
     out = cp.empty((arg.size, plan.nalpha))
     _launch('theta_grid', out.size, (cp.asarray(arg), cp.asarray(fun), _theta_table(plan),
                                    out, np.int32(arg.size), np.int32(plan.nalpha)))
-    return cp.asnumpy(out)
+    return out if _device else cp.asnumpy(out)
 
 
 def theta_adjoint(plan, x, arg, fun):
@@ -425,14 +498,16 @@ def theta_adjoint(plan, x, arg, fun):
 
 
 class _DevicePlan:
-    """Version-j dense interpolation; CPU exponent arguments and CPU GP API.
+    """Version-j dense interpolation, retaining the NumPy GP API.
 
     Fits of the spline/radial tables are left on the host. The large g,q
     arrays stay on the device between feature and potential evaluation.
     """
 
-    def __init__(self, base):
+    def __init__(self, base, device_output=False):
         self.base, self.p = base, {}
+        self.arguments = {}
+        self.device_output = device_output
 
     def __getattr__(self, name):
         return getattr(self.base, name)
@@ -458,12 +533,23 @@ class _DevicePlan:
             feat = np.empty((num, ng))
         if dfeat is None:
             dfeat = np.empty((num, ng))
-        dx = cp.asarray(np.ascontiguousarray(f))
+        dx = _device_array(f)
         values, derivs = cp.empty((num, ng)), cp.empty((num, ng))
-        rho_tuple = self.base.get_rho_tuple(rho_data)
+        rho_tuple = None if self.device_output else self.base.get_rho_tuple(rho_data)
+        if self.device_output:
+            from ciderpress.gpu.pasdw_exponents import arguments
+
+            if self.base.nldf_settings.sl_level == 'MGGA':
+                rho_data[4, rho_data[0] < self.base.rhocut] = 0.
+            device_rho = cp.asarray(rho_data)
+            self.arguments[spin] = []
         self.p[spin] = []
         for i in range(num):
-            arg = self.base.get_interpolation_arguments(rho_tuple, i=i)[0]
+            if self.device_output:
+                arg, da = arguments(self.base, device_rho, i)
+                self.arguments[spin].append(da)
+            else:
+                arg = self.base.get_interpolation_arguments(rho_tuple, i=i)[0]
             table = self.base._local_alpha_transform[i]
             device_table = _cached(self.base, ('spline', i), _signature(table),
                                    lambda cp: cp.asarray(table))
@@ -483,15 +569,18 @@ class _DevicePlan:
         out = cp.asarray(vf).copy() if vf is not None else cp.zeros_like(self.p[spin][0])
         v, df = cp.asarray(vfeat), cp.asarray(dfeat)
         vrho, drho = cp.array(vrho_data), cp.asarray(rho_data[1:4])
-        rho_tuple = self.base.get_rho_tuple(rho_data)
+        rho_tuple = None if self.device_output else self.base.get_rho_tuple(rho_data)
         for i, p in enumerate(self.p[spin]):
             out += p * v[i, :, None]
-            da = self.base.get_interpolation_arguments(rho_tuple, i=i)[1]
+            da = (self.arguments[spin][i] if self.device_output else
+                  self.base.get_interpolation_arguments(rho_tuple, i=i)[1])
             vrho[0] += cp.asarray(da[0]) * df[i] * v[i]
             vrho[1:4] += 2 * drho * cp.asarray(da[1]) * df[i] * v[i]
             if self.base.nldf_settings.sl_level == 'MGGA':
                 vrho[4] += cp.asarray(da[2]) * df[i] * v[i]
-        vrho_data[:] = cp.asnumpy(vrho)
+        vrho_data[:] = vrho if isinstance(vrho_data, cp.ndarray) else cp.asnumpy(vrho)
+        if self.device_output:
+            return out
         result = cp.asnumpy(out)
         if vf is not None:
             vf[:] = result
@@ -538,72 +627,68 @@ def _rhos(kernel, setup, atoms, D):
     if cache is None:
         cache = kernel._pasdw_rho_cache = {}
     if id(setup) not in cache or cache[id(setup)][0] != signature:
-        pairs = [calculate_cider_paw_correction(CiderRadialExpansion(RhoCalculator()),
-                    setup, D[a], separate_ae_ps=True) for a in atoms]
-        cache[id(setup)] = signature, tuple(np.stack([p[i] for p in pairs]) for i in (0, 1))
+        from ciderpress.gpu import use_gpu
+
+        if use_gpu('pasdw') and c.is_mgga:
+            from ciderpress.gpu.pasdw_reductions import density
+
+            values = density(c, np.stack([D[a] for a in atoms]))
+        else:
+            pairs = [calculate_cider_paw_correction(CiderRadialExpansion(RhoCalculator()),
+                        setup, D[a], separate_ae_ps=True) for a in atoms]
+            values = tuple(np.stack([p[i] for p in pairs]) for i in (0, 1))
+        cache[id(setup)] = signature, values
     return cache[id(setup)][1]
 
 
-class _PrecomputedCalculator:
-    def __init__(self, contrib, mode, index, values):
-        self.xc, self.mode, self.index, self.values = contrib, mode, index, values
-
-    def __call__(self, rgd, n, y, dn, dy, f, ae=True):
-        data = self.values[0 if ae else 1]
-        v = data[1][self.index]
-        if v.shape[1] == 5:
-            self.xc.contract_kinetic_potential(v[:, 4], ae)
-        if self.mode == 'energy':
-            return data[0][self.index], v[:, 0], v[:, 1:4], data[2][self.index]
-        return v[:, 0], v[:, 1:4]
-
-
 def _batch_energy(kernel, setup, atoms, D, projections, rhos):
-    from ciderpress.gpaw.atom_utils import CiderRadialExpansion, calculate_cider_paw_correction
     from ciderpress.gpaw.fit_paw_gauss_pot import get_dv
 
     contrib, p = setup.cider_contribs, setup.pa_setup
     count, ns = len(atoms), len(D[atoms[0]])
     na = projections[atoms[0]].shape[-1]
     dv = get_dv(setup.xc_correction.rgd)
-    # Preserve the original projector summation and dot ordering.
-    ft = []
-    for a in atoms:
-        fr = kernel.fr_asgLq[a]
-        f = np.zeros_like(kernel.df_asgLq[a])
-        for i in range(p.ni):
-            L, n, j = p.lmlist_i[i], p.nlist_i[i], p.jlist_i[i]
-            ref = (p.pfuncs_ng[n] * dv).dot(fr[:, :, L, :na])
-            for s in range(ns):
-                f[s, :, L, :na] += (projections[a][s, i] - ref[s]) * p.ffuncs_jg[j][:, None]
-        f += fr
-        ft.append(f)
-    ft = np.stack(ft)
-    df = np.stack([kernel.df_asgLq[a] for a in atoms])
+    cp = cupy()
+    fr = _join_device([kernel.fr_asgLq[a] for a in atoms])
+    df = _join_device([kernel.df_asgLq[a] for a in atoms])
+    shape = (count*ns,) + fr.shape[2:]
+    def project(x, to_radial, use_ffuncs=False):
+        return coefficients(p, x, None, to_radial, check_q=False, use_ffuncs=use_ffuncs,
+                            _nlm=fr.shape[-2])
+    weighted = fr.reshape(shape)[..., :na]*cp.asarray(dv)[:, None, None]
+    ref = project(weighted, False)
+    delta = cp.asarray(np.stack([projections[a] for a in atoms])).reshape(count*ns, p.ni, na)-ref
+    ft = cp.zeros_like(fr).reshape(shape)
+    ft[..., :na] = project(delta, True, True)
+    ft = ft.reshape(fr.shape)
+    ft += fr
     batch = _BatchContribs(contrib, count)
     values = []
     for rho, f in zip(rhos, (ft+df, ft)):
         rho = _pack_rho(rho)
-        v = np.zeros_like(rho)
+        v = cp.zeros(rho.shape, dtype=cp.float64)
         e = np.zeros(rho.shape[-1])
-        f = np.ascontiguousarray(f.swapaxes(0, 1))
+        f = _device_array(f.swapaxes(0, 1))
         vf = batch.energy(e, rho, v, f)
         values.append((e.reshape(count, -1), _unpack_rho(v, count), vf.swapaxes(0, 1)))
+    from ciderpress.gpu.pasdw_reductions import finish
+
+    energy, dh = finish(contrib, [(v[0], v[1]) for v in values], energy=True,
+                        _tables=getattr(contrib, '_pasdw_cycle_tables', None))
+    vf = cp.asarray(values[0][2]).reshape(shape)
+    vfr = vf - cp.asarray(values[1][2]).reshape(shape)
+    # All projectors see the unchanged AE-minus-PS difference. The original
+    # subsequent subtraction is a linear reconstruction of those coefficients.
+    d = project(vfr[..., :na], False, True)
+    vfr[..., :na] -= project(d, True)*cp.asarray(dv)[:, None, None]
+    d = cp.asnumpy(d).reshape(count, ns, p.ni, na)
+    vfr = vfr.reshape(fr.shape)
+    vf = vf.reshape(fr.shape)
     result, energies, potentials = {}, {}, {}
     for index, a in enumerate(atoms):
-        calc = _PrecomputedCalculator(contrib, 'energy', index, values)
-        expansion = CiderRadialExpansion(calc, ft[index], df[index])
-        energies[a], potentials[a], vf, vft = calculate_cider_paw_correction(
-            expansion, setup, D[a], separate_ae_ps=True)
-        vfr = vf - vft
-        vft[:] = vfr
-        result[a] = np.zeros((ns, p.ni, na))
-        for i in range(p.ni):
-            L, n, j = p.lmlist_i[i], p.nlist_i[i], p.jlist_i[i]
-            d = np.einsum('sgq,g->sq', vft[:, :, L, :na], p.ffuncs_jg[j])
-            result[a][:, i] = d
-            vfr[:, :, L, :na] -= (d[:, None, :] * p.pfuncs_ng[n][:, None]) * dv[:, None]
-        kernel.vfr_asgLq[a], kernel.vdf_asgLq[a] = vfr, vf
+        energies[a], potentials[a] = energy[index], dh[index]
+        result[a] = d[index]
+        kernel.vfr_asgLq[a], kernel.vdf_asgLq[a] = vfr[index], vf[index]
         kernel.fr_asgLq[a], kernel.df_asgLq[a] = None, None
     return result, energies, potentials
 
@@ -616,9 +701,6 @@ def calculate_corrections(kernel, setups, D, projections, vc):
     evaluate one contiguous point batch. Spherical BLAS transforms stay on
     the CPU to preserve their reduction order before the sensitive PAW fits.
     """
-    from ciderpress.gpaw.atom_utils import (
-        CiderRadialExpansion, calculate_cider_paw_correction)
-
     if not D:
         return ({}, {}, {}) if projections is not None else {}
     result = {}
@@ -630,46 +712,66 @@ def calculate_corrections(kernel, setups, D, projections, vc):
         # A feature call begins a new XC cycle. Recompute density once even
         # for repeated timing inputs; reuse it only in energy/potential stages.
         kernel._pasdw_rho_cache = {}
+        kernel._pasdw_theta_cache = {}
     for atoms in _groups(setups, D):
         setup = setups[atoms[0]]
         contrib = setup.cider_contribs
         ns = D[atoms[0]].shape[0]
         rhos = _rhos(kernel, setup, atoms, D)
-        batch = _BatchContribs(contrib, len(atoms))
+        theta_cache = getattr(kernel, '_pasdw_theta_cache', None)
+        if theta_cache is None:
+            theta_cache = kernel._pasdw_theta_cache = {}
+        if id(setup) not in theta_cache or theta_cache[id(setup)][0] is not rhos:
+            theta_cache[id(setup)] = rhos, {}
+        batch = _BatchContribs(contrib, len(atoms), theta_cache[id(setup)][1])
         if projections is not None:
             r, e, v = _batch_energy(kernel, setup, atoms, D, projections, rhos)
             result.update(r); energies.update(e); potentials.update(v)
             continue
         if vc is None:
-            x = [batch.features(_pack_rho(rho)).swapaxes(0, 1) for rho in rhos]
+            x = [batch.features(_pack_rho(rho), i).swapaxes(0, 1) for i, rho in enumerate(rhos)]
             shape = (-1,) + x[0].shape[2:]
-            xt = np.ascontiguousarray(x[1].reshape(shape))
-            dx = np.ascontiguousarray((x[0]-x[1]).reshape(shape))
-            fr, df, c = contrib.calculate_y_terms(xt, dx, setup.ps_setup)
+            xt = _device_array(x[1].reshape(shape))
+            dx = _device_array((x[0]-x[1]).reshape(shape))
+            from ciderpress.gpaw.atom_utils import USE_GAUSSIAN_SBT
+
+            if kernel._paw_algo == 'v1' and USE_GAUSSIAN_SBT:
+                from ciderpress.gpu.pasdw_pipeline import linear
+
+                fr, df, c = linear(contrib, setup.ps_setup, xt, dx)
+            else:
+                fr, df, c = contrib.calculate_y_terms(cupy().asnumpy(xt), cupy().asnumpy(dx), setup.ps_setup)
             for i, a in enumerate(atoms):
                 sl = slice(i*ns, (i+1)*ns)
                 kernel.fr_asgLq[a], kernel.df_asgLq[a], result[a] = fr[sl], df[sl], c[sl]
         else:
-            vfr = np.concatenate([kernel.vfr_asgLq[a] for a in atoms])
-            vdf = np.concatenate([kernel.vdf_asgLq[a] for a in atoms])
+            vfr = _join_device([kernel.vfr_asgLq[a] for a in atoms], stack=False)
+            vdf = _join_device([kernel.vdf_asgLq[a] for a in atoms], stack=False)
             vcoef = np.concatenate([vc[a] for a in atoms])
-            vxt, vdx = contrib.calculate_vx_terms(vfr, vdf, vcoef, setup.ps_setup)
+            from ciderpress.gpaw.atom_utils import USE_GAUSSIAN_SBT
+
+            if kernel._paw_algo == 'v1' and USE_GAUSSIAN_SBT:
+                from ciderpress.gpu.pasdw_pipeline import linear
+
+                vxt, vdx = linear(contrib, setup.ps_setup, vfr, vdf, vcoef)
+            else:
+                vxt, vdx = contrib.calculate_vx_terms(cupy().asnumpy(vfr), cupy().asnumpy(vdf), vcoef, setup.ps_setup)
             values = []
-            for rho, x in zip(rhos, (vdx, vdx-vxt)):
+            for index, (rho, x) in enumerate(zip(rhos, (vdx, vdx-vxt))):
                 rho = _pack_rho(rho)
-                v = np.zeros_like(rho)
-                x = np.ascontiguousarray(x.reshape(len(atoms), ns, *x.shape[1:]).swapaxes(0, 1))
-                batch.potential(rho, v, x)
+                v = cupy().zeros(rho.shape, dtype=cupy().float64)
+                x = _device_array(x.reshape(len(atoms), ns, *x.shape[1:]).swapaxes(0, 1))
+                batch.potential(rho, v, x, index)
                 values.append((None, _unpack_rho(v, len(atoms))))
+            from ciderpress.gpu.pasdw_reductions import finish
+
+            dh = finish(contrib, values, _tables=getattr(contrib, '_pasdw_cycle_tables', None))
             for i, a in enumerate(atoms):
                 sl = slice(i*ns, (i+1)*ns)
                 # v1 updates the caller's coefficient arrays in place.
                 if kernel._paw_algo == 'v1':
                     vc[a][:] = vcoef[sl]
-                expansion = CiderRadialExpansion(_PrecomputedCalculator(contrib, 'potential', i, values),
-                    vdx[sl] - vxt[sl], vxt[sl].copy())
-                result[a] = calculate_cider_paw_correction(expansion, setup, D[a],
-                                                          separate_ae_ps=True)
+                result[a] = dh[i]
     # Preserve the input dictionary's atom order across mixed-setup groups.
     result = {a: result[a] for a in D}
     if projections is not None:
