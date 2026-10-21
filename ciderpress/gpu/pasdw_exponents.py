@@ -1,0 +1,138 @@
+"""Version-j spline arguments on device, using the host plan's formulas."""
+import numpy as np
+from functools import lru_cache
+
+from ciderpress.gpu import cupy
+
+
+_SOURCE = r'''
+extern "C" __global__ void arguments(
+    const double* rho, double* out, int* large, int ng, int mgga,
+    double rhocut, double b, double c, double grad, double cut,
+    int smooth, int etb, double ratio, double inva, double scale, int sizem1) {
+    int g = blockDim.x*blockIdx.x + threadIdx.x;
+    if (g >= ng) return;
+    double raw = rho[g], n = raw < rhocut ? rhocut : raw;
+    bool low = raw < rhocut;
+    double sigma = rho[ng+g]*rho[ng+g] + rho[2*ng+g]*rho[2*ng+g];
+    sigma += rho[3*ng+g]*rho[3*ng+g];
+    if (low) sigma = 0;
+    double a = b*pow(n, 2.0/3.0), dn = 2*b/(3*pow(n, 1.0/3.0));
+    double ds = 0, dt = 0;
+    if (mgga) {
+        double tau = low ? 0 : rho[4*ng+g];
+        a += c*tau/n;
+        dn -= (c*tau/n)/n;
+        dt = c/n;
+    }
+    if (grad != 0) {
+        a += grad*sigma/(n*n);
+        ds = grad/(n*n);
+        dn -= 2*grad*sigma/(n*n*n);
+    }
+    if (low) dn = ds = dt = 0;
+    if (smooth) {
+        double x = a/cut, power = 1, total = 0, dtotal = 0;
+        for (int m = 1; m <= 12; m++) {
+            dtotal += power;
+            power *= x;
+            total += power/m;
+        }
+        double ex = exp(-total), derivative = ex*dtotal;
+        a = cut*(1-ex);
+        dn *= derivative; ds *= derivative; dt *= derivative;
+    }
+    large[g] = raw > rhocut && a > cut;
+    double arg, derivative;
+    if (etb) {
+        derivative = ratio/a;
+        arg = log(a*inva)*ratio;
+    } else {
+        derivative = ratio*inva/(a*inva+1);
+        arg = log(a*inva+1)*ratio;
+    }
+    arg *= scale;
+    derivative *= scale;
+    if (!(arg > 0)) { arg = 0; derivative = 0; }
+    if (!(arg < sizem1)) { arg = sizem1-1e-10; derivative = 0; }
+    out[g] = arg;
+    out[ng+g] = dn*derivative;
+    out[2*ng+g] = ds*derivative;
+    if (mgga) out[3*ng+g] = dt*derivative;
+}
+extern "C" __global__ void theta_potential(
+    const double* x, const double* rho, const double* arg, const double* fun,
+    const double* da, const double* df, const double* table, double* v,
+    int ng, int nq, int nx) {
+    int g = blockDim.x*blockIdx.x + threadIdx.x;
+    if (g >= ng) return;
+    int cell = (int)arg[g];
+    double d = arg[g]-cell, va = 0, vf = 0;
+    for (int q = 0; q < nq; q++) {
+        const double* w = table + (cell*nq+q)*4;
+        double p = w[0]+d*(w[1]+d*(w[2]+d*w[3]));
+        double dp = w[1]+d*(2*w[2]+d*3*w[3]);
+        vf += p*x[g*nq+q];
+        va += dp*x[g*nq+q];
+    }
+    va *= fun[g];
+    v[g] += va*da[g] + vf*df[g];
+    double tmp = va*da[ng+g] + vf*df[ng+g];
+    for (int j = 1; j < 4; j++) v[j*ng+g] += (2*rho[j*ng+g])*tmp;
+    if (nx == 5) v[4*ng+g] += va*da[2*ng+g] + vf*df[2*ng+g];
+}
+'''
+
+
+@lru_cache(None)
+def _kernel(name='arguments'):
+    return cupy().RawKernel(_SOURCE, name, options=('--fmad=false',))
+
+
+def arguments(plan, rho, i):
+    """Device argument and all density/sigma/tau derivatives, in FP64."""
+    from ciderpress.dft.settings import CFC
+
+    cp = cupy()
+    rho = cp.ascontiguousarray(cp.asarray(rho))
+    params = plan.nldf_settings.theta_params if i == -1 else plan.nldf_settings.feat_params[i]
+    mgga = plan.nldf_settings.sl_level == 'MGGA'
+    a0, grad_mul = params[:2]
+    tau_mul = params[2] if mgga else 0.
+    tau_fac = tau_mul*1.2*(6*np.pi**2)**(2./3)/np.pi
+    b = np.pi/(2**(2./3) if plan.nspin == 1 else 1.)*(a0-tau_fac)
+    c = np.pi/2**(2./3)*tau_fac/CFC
+    g = 0.
+    if grad_mul != 0:
+        g = grad_mul*1.2*(6*np.pi**2)**(2./3)/np.pi
+        g *= np.pi/2**(2./3)*.125/CFC
+    ratio, inva = 1./np.log(plan.lambd), 1./plan.alpha0
+    scale = (plan._spline_size-1)/(plan.nalpha-1)
+    ng = rho.shape[-1]
+    out = cp.empty((4 if mgga else 3, ng), dtype=cp.float64)
+    large = cp.empty(ng, dtype=cp.int32)
+    if ng:
+        _kernel()(((ng+255)//256,), (256,), (
+            rho, out, large, np.int32(ng), np.int32(mgga),
+            *(np.float64(v) for v in (plan.rhocut, b, c, g, np.max(plan.alphas))),
+            np.int32(plan._use_smooth_expnt_cutoff), np.int32(plan.alpha_formula == 'etb'),
+            *(np.float64(v) for v in (ratio, inva, scale)), np.int32(plan._spline_size-1)))
+    if plan._raise_large_expnt_error and bool(cp.any(large)):
+        raise RuntimeError('NLDF exponent is too large! Please increase nalpha/alpha_max.')
+    return out[0], tuple(out[j] for j in range(1, len(out)))
+
+
+def theta_potential(plan, grid, rho, arg, fun, da, df, out):
+    """Add the theta adjoint directly to a private device potential buffer."""
+    from ciderpress.gpu.pasdw import _theta_table
+
+    cp = cupy()
+    ng, nq = grid.shape
+    nx = rho.shape[0]
+    assert out.shape == rho.shape and out.dtype == np.float64 and out.flags.c_contiguous
+    if ng:
+        _kernel('theta_potential')(((ng+255)//256,), (256,), (
+            cp.ascontiguousarray(grid), cp.asarray(rho), cp.asarray(arg), cp.asarray(fun),
+            cp.asarray(np.stack(da)), cp.asarray(np.stack(df)), _theta_table(plan), out,
+            np.int32(ng), np.int32(nq), np.int32(nx)))
+    return out
