@@ -81,13 +81,18 @@ plan reconstructs the original threshold before applying the new spin count.
 
 Meta-GGA feature exponents are evaluated with spin-scaled density, squared
 gradient and kinetic density, followed by the corresponding chain rule for
-their derivatives.  This keeps mathematically equivalent spin representations
-on the same exponent arithmetic path.  The full atomic and nonlocal evaluation
-can still amplify rounding differences in its inputs: fixed-input checks have
-shown kinetic-density-potential differences of order 1e-8 between equivalent
-spin representations.  A single successful comparison does not establish
-uniform 1e-10 agreement across numerical layouts.  Representation checks,
-magnetic SCF convergence and magnetic force validation are separate requirements.
+their derivatives.  Atomic kinetic densities also use the single-channel
+contraction separately for each spin, with the corresponding density-matrix
+scaling and core division.  Both transformations preserve their original
+mathematical definitions and derivatives.  Keeping these arithmetic paths
+consistent removes representation-dependent rounding before it can be
+amplified by the atomic and nonlocal projections.
+
+Representative fixed-input comparisons pass the 1e-10 criterion with one,
+two and four MPI ranks.  They include the atomic matrices and a spin exchange;
+atomic linear-adjoint tests cover polarized inputs as well.  These checks do
+not replace magnetic SCF convergence, magnetic force validation or validation
+of a different numerical layout.
 
 The smooth exponent saturation evaluates ``1 - exp(-t)`` through
 ``-expm1(-t)`` to retain small values without cancellation.  Its polynomial,
