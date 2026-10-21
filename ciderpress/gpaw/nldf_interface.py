@@ -110,6 +110,8 @@ class LibCiderPW:
         self.initialized = False
         ptr = c_null_ptr()
         self.shape = tuple(N_c)
+        self._cell_cv = cell_cv.copy()
+        self._device_work = None
         if plan is None:
             self.alpha_norms = np.ones(1)
             self.alphas = np.ones(1)
@@ -197,14 +199,50 @@ class LibCiderPW:
         self._local_shape_recip = size_data[4:7]
         self._klda = size_data[7]
         self.initialized = True
+        # The C kernel owns copies of these arrays from this point onwards.
+        self._fft_norms = self.norms_ab.copy()
+        self._fft_expnts = self.expnts_ab.copy()
+
+    def _host_work(self):
+        return np.ctypeslib.as_array(
+            pwutil.ciderpw_get_work_pointer(self._ptr),
+            shape=(2 * int(self.get_work_size()),))
+
+    def _gpu_work(self):
+        from ciderpress.gpu import cupy, use_gpu
+
+        selected = use_gpu("nldf_fft") and self.comm.size == 1 and self.nalpha == self.nbeta
+        work = self._device_work
+        if work is not None and (not selected or work.device != cupy().cuda.Device().id):
+            with cupy().cuda.Device(work.device):
+                work.raw.get(out=self._host_work())
+            self._device_work = None
+        if selected and self._device_work is None:
+            from ciderpress.gpu.nldf_fft import DeviceWork
+
+            self._device_work = DeviceWork(self, self._host_work())
+        return self._device_work
+
+    def _sync_work_to_host(self):
+        work = self._gpu_work()
+        if work is not None:
+            work.raw.get(out=self._host_work())
+
+    def _sync_work_from_host(self):
+        if self._device_work is not None:
+            self._device_work.raw.set(self._host_work())
+            self._device_work.sync()
 
     def fftv2(self, arr_gq):
+        self._sync_work_to_host()
         pwutil.ciderpw_g2k_v2(
             self._ptr,
             arr_gq.ctypes.data_as(ctypes.c_void_p),
         )
+        self._sync_work_from_host()
 
     def fft(self, in_xg, out_xg):
+        self._sync_work_to_host()
         if self.has_mpi:
             fn = pwutil.ciderpw_g2k_mpi_gpaw
         else:
@@ -215,8 +253,10 @@ class LibCiderPW:
                 in_xg[x].ctypes.data_as(ctypes.c_void_p),
                 out_xg[x].ctypes.data_as(ctypes.c_void_p),
             )
+        self._sync_work_from_host()
 
     def ifft(self, in_xg, out_xg):
+        self._sync_work_to_host()
         if self.has_mpi:
             fn = pwutil.ciderpw_k2g_mpi_gpaw
         else:
@@ -227,20 +267,29 @@ class LibCiderPW:
                 in_xg[x].ctypes.data_as(ctypes.c_void_p),
                 out_xg[x].ctypes.data_as(ctypes.c_void_p),
             )
+        self._sync_work_from_host()
 
     def compute_forward_convolution(self):
+        work = self._gpu_work()
+        if work is not None:
+            return work.convolve()
         pwutil.ciderpw_compute_features(self._ptr)
 
     def compute_backward_convolution(self):
+        work = self._gpu_work()
+        if work is not None:
+            return work.convolve()
         pwutil.ciderpw_compute_potential(self._ptr)
 
     def compute_backward_convolution_with_stress(self, theta_gq):
+        self._sync_work_to_host()
         stress_vv = np.zeros((3, 3))
         pwutil.ciderpw_convolution_potential_and_stress(
             self._ptr,
             stress_vv.ctypes.data_as(ctypes.c_void_p),
             theta_gq.ctypes.data_as(ctypes.c_void_p),
         )
+        self._sync_work_from_host()
         return stress_vv
 
     def fill_vj_feature_(self, feat_g, p_gq):
@@ -261,6 +310,9 @@ class LibCiderPW:
         assert p_gq.flags.c_contiguous
         assert feat_g.shape == p_gq.shape[:-1] == tuple(self._local_shape_real)
         assert p_gq.shape[-1] == self.nalpha
+        work = self._gpu_work()
+        if work is not None:
+            return work.feature(feat_g, p_gq)
         pwutil.ciderpw_eval_feature_vj(
             self._ptr,
             feat_g.ctypes.data_as(ctypes.c_void_p),
@@ -284,6 +336,9 @@ class LibCiderPW:
         assert p_gq.flags.c_contiguous
         assert vfeat_g.shape == p_gq.shape[:-1] == tuple(self._local_shape_real)
         assert p_gq.shape[-1] == self.nalpha
+        work = self._gpu_work()
+        if work is not None:
+            return work.set_work(vfeat_g, p_gq, add=True)
         pwutil.ciderpw_add_potential_vj(
             self._ptr,
             vfeat_g.ctypes.data_as(ctypes.c_void_p),
@@ -302,6 +357,9 @@ class LibCiderPW:
         assert p_gq.flags.c_contiguous
         assert fun_g.shape == p_gq.shape[:-1] == tuple(self._local_shape_real)
         assert p_gq.shape[-1] == self.nalpha
+        work = self._gpu_work()
+        if work is not None:
+            return work.set_work(fun_g, p_gq)
         pwutil.ciderpw_set_work(
             self._ptr,
             fun_g.ctypes.data_as(ctypes.c_void_p),
@@ -312,6 +370,9 @@ class LibCiderPW:
         """
         Set the internal work array to zero.
         """
+        work = self._gpu_work()
+        if work is not None:
+            return work.reset()
         pwutil.ciderpw_zero_work(self._ptr)
 
     def get_radial_info_for_atom(self, local_indices, local_fdisps):
@@ -366,6 +427,9 @@ class LibCiderPW:
         assert funcs_gb.dtype == np.float64
         assert indset.flags.c_contiguous
         assert indset.dtype == np.int64
+        work = self._gpu_work()
+        if work is not None:
+            return work.scatter(funcs_gb, indset)
         pwutil.ciderpw_add_atom_info(
             self._ptr,
             funcs_gb.ctypes.data_as(ctypes.c_void_p),
@@ -380,6 +444,9 @@ class LibCiderPW:
         """
         assert funcs_gb.flags.c_contiguous
         assert indset.flags.c_contiguous
+        work = self._gpu_work()
+        if work is not None:
+            return work.gather(funcs_gb, indset)
         pwutil.ciderpw_set_atom_info(
             self._ptr,
             funcs_gb.ctypes.data_as(ctypes.c_void_p),
@@ -430,6 +497,10 @@ class LibCiderPW:
         work array; it might contain some uninitialized buffer.
         """
         arr = np.empty(self.get_work_size() * self.nalpha, dtype=np.complex128)
+        work = self._gpu_work()
+        if work is not None:
+            work.raw.get(out=arr[:int(self.get_work_size())].view(np.float64))
+            return arr
         pwutil.ciderpw_copy_work_array(self._ptr, arr.ctypes.data_as(ctypes.c_void_p))
         return arr
 
