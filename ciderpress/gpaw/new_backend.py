@@ -219,11 +219,10 @@ class CiderNewMGGAFunctional(MGGAFunctional):
             from gpaw.gpu import cupy
             if xp is not cupy:
                 raise NotImplementedError('New CIDER supports numpy or GPAW cupy only')
-            # Real CuPy only (never GPAW's fake cpupy): enable the optional
-            # GPU kernels behind the engine's NumPy interfaces.
-            if getattr(xp, '__name__', '') == 'cupy':
-                from ciderpress import gpu as cider_gpu
-                cider_gpu.enable()
+        # Record ownership without changing dispatch or the current device,
+        # even if construction subsequently fails. CPUPY is always CPU.
+        self._device = (xp.cuda.Device().id
+                        if getattr(xp, '__name__', '') == 'cupy' else None)
         if grid.comm.size != 1:
             raise NotImplementedError('New CIDER does not support domain parallelism')
         old = MGGA(LibXC('PBE'), stencil=2)
@@ -239,8 +238,7 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         self.setups = None
         self._density = None
         self._paw_ready = False
-        # One record per boundary operation, including zero-cost numpy no-ops.
-        # Synchronization excludes preceding device work from copy timings.
+        # Bounded diagnostics, including no-op boundaries for profile callers.
         self.transfer_timings = []
 
     def _transfer(self, array, xp, label):
@@ -261,6 +259,7 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         self.transfer_timings.append(dict(operation=label, seconds=seconds,
             bytes=int(array.data.size * array.data.dtype.itemsize),
             copied=source is not xp))
+        del self.transfer_timings[:-256]
         return result
 
     def set_context(self, *, setups, relpos_ac, atomdist,
@@ -323,6 +322,15 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         self._paw_ready = False
 
     def calculate(self, nt_sr, taut_sr=None):
+        from ciderpress.gpu import policy
+        with policy(self._device):
+            for array in (nt_sr, taut_sr):
+                device = getattr(getattr(array, 'data', None), 'device', None)
+                if self._device is not None and device is not None and device.id != self._device:
+                    raise ValueError('New CIDER input differs from its recorded CUDA device')
+            return self._calculate(nt_sr, taut_sr)
+
+    def _calculate(self, nt_sr, taut_sr=None):
         self._paw_ready = False
         if nt_sr.dims != (1,):
             raise NotImplementedError('New CIDER does not support spin polarization')
@@ -355,6 +363,11 @@ class CiderNewMGGAFunctional(MGGAFunctional):
                 self._transfer(d, xp, 'dedtau_to_device'))
 
     def calculate_paw_correction(self, setup, D_sp, dH_sp=None, a=None):
+        from ciderpress.gpu import policy
+        with policy(self._device):
+            return self._calculate_paw_correction(setup, D_sp, dH_sp, a)
+
+    def _calculate_paw_correction(self, setup, D_sp, dH_sp=None, a=None):
         if not self._paw_ready:
             raise RuntimeError('New CIDER PAW correction requires current grid XC')
         engine = self.engine

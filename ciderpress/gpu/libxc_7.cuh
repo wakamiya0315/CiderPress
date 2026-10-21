@@ -10,9 +10,18 @@
 #define M_PI 3.14159265358979323846
 #define my_piecewise3(c, x1, x2) ((c) ? (x1) : (x2))
 #define my_piecewise5(c1, x1, c2, x2, x3) ((c1) ? (x1) : ((c2) ? (x2) : (x3)))
+/*
+ Copyright (C) 2006-2007 M.A.L. Marques
+ Copyright (C) 2019 X. Andrade
+
+ This Source Code Form is subject to the terms of the Mozilla Public
+ License, v. 2.0. If a copy of the MPL was not distributed with this
+ file, You can obtain one at http://mozilla.org/MPL/2.0/.
+*/
 // src/maple2c/lda_exc/lda_x.c SHA256 1102ae1c6e81d29cf45c608664cfc762b7b7231c55c0d78b04d54f4d1d352e47
 // src/maple2c/gga_exc/gga_x_pbe.c SHA256 d80e94afcee4e0fbf5b64c2bc37a7f80798a2f6d4a2a50a13d06bff8a3e8357c
 // src/maple2c/gga_exc/gga_c_pbe.c SHA256 0b0045c5027af1e250128a4243285715714d31ebbf6ff83dab52ca03cc17ad70
+// src/util.h SHA256 7679744982b3b944f3054b7d2b298612d7b4f3a1051f4f48f4fded2ef26f04b5
 #define M_SQRTPI        1.772453850905516027298167483341145182798L
 #define M_CBRTPI        1.464591887561523263020142527263790391739L
 #define M_SQRT3         1.732050807568877293527446341505872366943L
@@ -44,7 +53,7 @@ __device__ inline void lda_x_unpol(const double* rho, const double* sigma, doubl
   t16 = (1.0) * t15;
   tzk0 = 0.2e1 * t16;
 
-  
+
     zk[0] += tzk0;
 
   t17 = rho[0] * (1.0);
@@ -52,7 +61,7 @@ __device__ inline void lda_x_unpol(const double* rho, const double* sigma, doubl
   t23 = my_piecewise3(t2, 0, -t6 * t10 / t18 / 0.8e1);
   tvrho0 = 0.2e1 * t17 * t23 + 0.2e1 * t16;
 
-  
+
     vrho[0] += tvrho0;
 
 }
@@ -99,7 +108,7 @@ __device__ inline void lda_x_pol(const double* rho, const double* sigma, double*
   t40 = (1.0) * t39;
   tzk0 = t25 + t40;
 
-  
+
     zk[0] += tzk0;
 
   t41 = t13 * t7;
@@ -130,7 +139,7 @@ __device__ inline void lda_x_pol(const double* rho, const double* sigma, double*
   t92 = (1.0) * t91;
   tvrho0 = t25 + t40 + t6 * (t69 + t92);
 
-  
+
     vrho[0] += tvrho0;
 
   t95 = rho[0] * rho[0];
@@ -146,7 +155,7 @@ __device__ inline void lda_x_pol(const double* rho, const double* sigma, double*
   t123 = (1.0) * t122;
   tvrho1 = t25 + t40 + t6 * (t107 + t123);
 
-  
+
     vrho[1] += tvrho1;
 
 }
@@ -190,7 +199,7 @@ __device__ inline void gga_x_pbe_unpol(const double* rho, const double* sigma, d
   t46 = my_piecewise3(t2, 0, -0.3e1 / 0.8e1 * t6 * t17 * t18 * t42);
   tzk0 = 0.2e1 * t46;
 
-  
+
     zk[0] += tzk0;
 
   t52 = t30 * rho[0];
@@ -203,7 +212,7 @@ __device__ inline void gga_x_pbe_unpol(const double* rho, const double* sigma, d
   t69 = my_piecewise3(t2, 0, -t6 * t17 / t31 * t42 / 0.8e1 + t58 * t65 / 0.24e2);
   tvrho0 = 0.2e1 * rho[0] * t69 + 0.2e1 * t46;
 
-  
+
     vrho[0] += tvrho0;
 
   t78 = t20 * t25 * t28;
@@ -211,7 +220,7 @@ __device__ inline void gga_x_pbe_unpol(const double* rho, const double* sigma, d
   t82 = my_piecewise3(t2, 0, -t6 * t17 / t18 / t30 * t56 * t79 / 0.64e2);
   tvsigma0 = 0.2e1 * rho[0] * t82;
 
-  
+
     vsigma[0] += tvsigma0;
 
 }
@@ -288,7 +297,7 @@ __device__ inline void gga_x_pbe_pol(const double* rho, const double* sigma, dou
   t81 = my_piecewise3(t53, 0, -0.3e1 / 0.8e1 * t5 * t62 * t77);
   tzk0 = t52 + t81;
 
-  
+
     zk[0] += tzk0;
 
   t82 = t6 * t6;
@@ -320,7 +329,7 @@ __device__ inline void gga_x_pbe_pol(const double* rho, const double* sigma, dou
   t131 = my_piecewise3(t53, 0, -0.3e1 / 0.8e1 * t5 * t122 * t77 - t129);
   tvrho0 = t52 + t81 + t6 * (t115 + t131);
 
-  
+
     vrho[0] += tvrho0;
 
   t135 = my_piecewise5(t10, 0, t14, 0, -t7 - t84);
@@ -341,7 +350,7 @@ __device__ inline void gga_x_pbe_pol(const double* rho, const double* sigma, dou
   t168 = my_piecewise3(t53, 0, -0.3e1 / 0.8e1 * t5 * t150 * t77 - t129 + t155 * t164 / 0.24e2);
   tvrho1 = t52 + t81 + t6 * (t144 + t168);
 
-  
+
     vrho[1] += tvrho1;
 
   t171 = t28 * t33;
@@ -349,19 +358,19 @@ __device__ inline void gga_x_pbe_pol(const double* rho, const double* sigma, dou
   t176 = my_piecewise3(t1, 0, -t102 * t173 / 0.64e2);
   tvsigma0 = t6 * t176;
 
-  
+
     vsigma[0] += tvsigma0;
 
   tvsigma1 = 0.e0;
 
-  
+
     vsigma[1] += tvsigma1;
 
   t178 = t158 * t171 * t68;
   t181 = my_piecewise3(t53, 0, -t155 * t178 / 0.64e2);
   tvsigma2 = t6 * t181;
 
-  
+
     vsigma[2] += tvsigma2;
 
 }
@@ -462,7 +471,7 @@ __device__ inline void gga_c_pbe_unpol(const double* rho, const double* sigma, d
   t113 = t62 * t112;
   tzk0 = -t32 + t57 + t113;
 
-  
+
     zk[0] += tzk0;
 
   t115 = 0.1e1 / t7 / rho[0];
@@ -534,7 +543,7 @@ __device__ inline void gga_c_pbe_unpol(const double* rho, const double* sigma, d
   t217 = t62 * t214 * t215;
   tvrho0 = -t32 + t57 + t113 + rho[0] * (t119 + t144 - t149 - t162 + t217);
 
-  
+
     vrho[0] += tvrho0;
 
   t220 = rho[0] * (0.031090690869654895034);
@@ -550,7 +559,7 @@ __device__ inline void gga_c_pbe_unpol(const double* rho, const double* sigma, d
   t240 = t232 * t109 - t236 * t238;
   tvsigma0 = t220 * t61 * t240 * t215;
 
-  
+
     vsigma[0] += tvsigma0;
 
 }
@@ -704,7 +713,7 @@ __device__ inline void gga_c_pbe_pol(const double* rho, const double* sigma, dou
   t152 = t101 * t151;
   tzk0 = -t33 + t89 + t91 + t152;
 
-  
+
     zk[0] += tzk0;
 
   t154 = 0.1e1 / t8 / t7;
@@ -830,7 +839,7 @@ __device__ inline void gga_c_pbe_pol(const double* rho, const double* sigma, dou
   t338 = t158 + t183 + t187 - t192 + t206 + t239 + t241 - t246 - t251 + t265 + t337;
   tvrho0 = t7 * t338 + t152 - t33 + t89 + t91;
 
-  
+
     vrho[0] += tvrho0;
 
   t340 = -t41 - t194;
@@ -868,7 +877,7 @@ __device__ inline void gga_c_pbe_pol(const double* rho, const double* sigma, dou
   t399 = t158 + t183 - t187 - t192 + t351 + t239 + t353 - t246 - t251 + t364 + t398;
   tvrho1 = t7 * t399 + t152 - t33 + t89 + t91;
 
-  
+
     vrho[1] += tvrho1;
 
   t401 = t7 * (0.031090690869654895034);
@@ -889,7 +898,7 @@ __device__ inline void gga_c_pbe_pol(const double* rho, const double* sigma, dou
   t422 = t412 * t148 - t418 * t420;
   tvsigma0 = t401 * t100 * t422 * t335;
 
-  
+
     vsigma[0] += tvsigma0;
 
   t427 = t405 / 0.48e2 + t409 / 0.768e3;
@@ -899,12 +908,12 @@ __device__ inline void gga_c_pbe_pol(const double* rho, const double* sigma, dou
   t433 = t100 * t432;
   tvsigma1 = t401 * t433 * t335;
 
-  
+
     vsigma[1] += tvsigma1;
 
   tvsigma2 = tvsigma0;
 
-  
+
     vsigma[2] += tvsigma2;
 
 }

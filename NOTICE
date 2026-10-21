@@ -13,3 +13,17 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>
+
+CiderPress GPU libxc component
+
+ciderpress/gpu/libxc_7.cuh derives first derivatives and constants from
+libxc 7.0.0 (src/maple2c/{lda,gga}_exc and src/util.h), an MPL-2.0 component.
+The file retains the applicable MPL notice and util.h copyright notices:
+Copyright (C) 2006-2007 M.A.L. Marques
+Copyright (C) 2019 X. Andrade
+
+Source: https://gitlab.com/libxc/libxc/-/tree/7.0.0
+License: https://mozilla.org/MPL/2.0/
+Source hashes and reproduction instructions are in the generated header
+and ciderpress/gpu/generate_libxc.py. Changes fix default parameters and
+adapt declarations/output pointers for CUDA; arithmetic order is preserved.

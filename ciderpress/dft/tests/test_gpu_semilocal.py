@@ -47,9 +47,14 @@ def test_libxc_threshold_and_spin(device, monkeypatch, nspin, xcid):
 
 
 @pytest.mark.parametrize("nspin", [1, 2])
-def test_mapped_all_derivatives_and_model_mutation(device, monkeypatch, nspin):
+@pytest.mark.parametrize('negative', [False, True])
+def test_mapped_all_derivatives_and_model_mutation(device, monkeypatch, nspin, negative):
     from ciderpress.gpaw.new_backend import CiderXC
     model = CiderXC().mlfunc
+    if negative:
+        for kernel in model.kernels:
+            for feature in kernel.feature_list.feat_list:
+                feature.i = -1
     rng = np.random.default_rng(91)
     n = 129
     r = rng.uniform(.001, 3., (nspin, n))
@@ -107,7 +112,8 @@ def test_gpu_directional_derivative(device, monkeypatch, nspin):
     np.testing.assert_allclose(fd, analytic, atol=1e-7, rtol=1e-6)
 
 
-def test_descriptor_adjoint(device):
+@pytest.mark.parametrize('negative', [False, True])
+def test_descriptor_adjoint(device, negative):
     from ciderpress.gpaw.new_backend import CiderXC
     from ciderpress.gpu.descriptors import forward, backward
     cp = device
@@ -115,10 +121,21 @@ def test_descriptor_adjoint(device):
     raw = rng.uniform(.1, 2, (6, 129))
     direction = rng.normal(size=raw.shape)
     for k in CiderXC().mlfunc.kernels:
+        if negative:
+            for feature in k.feature_list.feat_list:
+                feature.i = -1
         dual = rng.normal(size=(129,k.N1))
-        eps = 1e-5
+        expected = k.feature_list(raw.T)
+        np.testing.assert_allclose(forward(k.feature_list, cp.asarray(raw)).get(), expected,
+                                   atol=1e-12, rtol=1e-12)
+        # The aliased negative-index maps have higher curvature on this
+        # input: 1e-5 has a measurable O(eps**2) truncation error on CPU too.
+        eps = 1e-6
         jdx = (forward(k.feature_list,cp.asarray(raw+eps*direction))-
                forward(k.feature_list,cp.asarray(raw-eps*direction)))/(2*eps)
         jty = backward(k.feature_list,cp.asarray(raw),cp.asarray(dual))
+        cpu_jty = np.zeros_like(raw)
+        k.feature_list.fill_derivs_(cpu_jty, dual.T, raw)
+        np.testing.assert_allclose(jty.get(), cpu_jty, atol=1e-12, rtol=1e-12)
         left, right = float(cp.sum(jdx*cp.asarray(dual))), float(cp.sum(cp.asarray(direction)*jty))
         np.testing.assert_allclose(left, right, atol=1e-8, rtol=1e-8)

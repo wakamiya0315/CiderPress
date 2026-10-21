@@ -22,6 +22,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 /** int_0^infty dr r^(2*l+2) exp(-a*r^2) */
 inline double gauss_integral(int l, double a) {
@@ -1108,24 +1109,32 @@ void contract_rad_to_orb(double *theta_rlmq, double *p_uq, int *ra_loc,
 /* Same expression as the radial transforms. Tabulate once on the host so
  * optional device transforms use exactly the CPU radial basis, including
  * libm rounding. No fit, factorization or solve is moved to the device. */
-void tabulate_pasdw_radial(atc_basis_set *atco, double *rads, int nrad,
+int tabulate_pasdw_radial(atc_basis_set *atco, double *rads, int nrad,
                           double *table) {
+    if (nrad < 0 || atco->nbas < 0 ||
+        (nrad && (size_t)atco->nbas > SIZE_MAX / sizeof(double) / (size_t)nrad))
+        return -1;
     for (int ish = 0; ish < atco->nbas; ish++) {
-        int *ibas = atco->bas + ish * BAS_SLOTS;
+        int *ibas = atco->bas + (size_t)ish * BAS_SLOTS;
         int l = ibas[ANG_OF];
         double coef = atco->env[ibas[PTR_COEFF]];
         double beta = atco->env[ibas[PTR_EXP]];
         for (int r = 0; r < nrad; r++) {
-            table[ish * nrad + r] =
+            table[(size_t)ish * (size_t)nrad + (size_t)r] =
                 coef * pow(rads[r], l) * exp(-beta * rads[r] * rads[r]);
         }
     }
+    return 0;
 }
 
 /* Host tabulation also avoids redundant exponential evaluations for each
  * atom and each OpenMP worker in atc_reciprocal_convolution. */
-void tabulate_pasdw_convolution(double *k_k, double *alphas, double *norms,
+int tabulate_pasdw_convolution(double *k_k, double *alphas, double *norms,
                                int nk, int nq, double *table) {
+    if (nk < 0 || nq < 0 ||
+        (nq && ((size_t)nq > SIZE_MAX / sizeof(double) / (size_t)nq ||
+         (size_t)nk > SIZE_MAX / sizeof(double) / (size_t)nq / (size_t)nq)))
+        return -1;
     double FPI = 16 * atan(1.0);
     for (int q2 = 0; q2 < nq; q2++) {
         for (int q1 = 0; q1 < nq; q1++) {
@@ -1134,10 +1143,11 @@ void tabulate_pasdw_convolution(double *k_k, double *alphas, double *norms,
             factor *= pow(FPI * exponent, 1.5);
             for (int k = 0; k < nk; k++) {
                 double mk2 = -1.0 * k_k[k] * k_k[k];
-                table[(k * nq + q2) * nq + q1] = factor * exp(mk2 * exponent);
+                table[((size_t)k * (size_t)nq + (size_t)q2) * (size_t)nq + (size_t)q1] = factor * exp(mk2 * exponent);
             }
         }
     }
+    return 0;
 }
 
 /**

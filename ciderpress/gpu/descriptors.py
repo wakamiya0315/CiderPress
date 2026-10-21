@@ -10,7 +10,7 @@ import numpy as np
 from ciderpress.gpu import cupy
 
 
-def signature(features):
+def signature(features, nraw=None):
     from ciderpress.dft.transform_data import SLXMap, SLTMap, SLNMap, VMap
     rows = []
     for f in features.feat_list:
@@ -25,10 +25,26 @@ def signature(features):
             rows.append(("V", f.i, 0, float(f.gamma), float(f.scale), float(f.center)))
         else:
             return None
+    if nraw is not None:
+        from operator import index
+        normalized = []
+        for row in rows:
+            kind, i, j, *params = row
+            if isinstance(i, (bool, np.bool_)) or isinstance(j, (bool, np.bool_)):
+                return None
+            try:
+                i = index(i)
+                j = index(j)
+            except TypeError:
+                return None
+            if not (-nraw <= i < nraw and -nraw <= j < nraw):
+                return None
+            normalized.append((kind, i % nraw, j % nraw, *params))
+        rows = normalized
     return tuple(rows)
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=128)
 def _kernel(rows, nraw, backward):
     fragments = []
     for k, row in enumerate(rows):
@@ -69,8 +85,10 @@ def _kernel(rows, nraw, backward):
 
 def forward(features, x):
     cp = cupy()
-    rows = signature(features)
     nraw, n = x.shape
+    rows = signature(features, nraw)
+    if rows is None:
+        raise ValueError('Unsupported descriptor map or feature index')
     out = cp.empty((n, len(rows)))
     if n:
         _kernel(rows, nraw, False)(((n+127)//128,), (128,), (x, x, out, np.int64(n)))
@@ -79,8 +97,10 @@ def forward(features, x):
 
 def backward(features, x, df):
     cp = cupy()
-    rows = signature(features)
     nraw, n = x.shape
+    rows = signature(features, nraw)
+    if rows is None:
+        raise ValueError('Unsupported descriptor map or feature index')
     out = cp.empty_like(x)
     if n:
         _kernel(rows, nraw, True)(((n+127)//128,), (128,), (x, df, out, np.int64(n)))

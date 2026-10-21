@@ -15,11 +15,11 @@ from ciderpress.gpu.rbf import _kernel, _model
 _CODES = {"LDA_X": 1, "GGA_X_PBE": 101, "GGA_C_PBE": 130}
 
 
-def supported(model):
+def supported(model, nraw=None):
     from ciderpress.dft.xc_evaluator import RBFEvaluator
     from ciderpress.dft.xc_evaluator2 import MappedDFTKernel2
     return bool(model.kernels) and all(type(k) is MappedDFTKernel2 and k.mode in ("SEP", "NPOL") and
-               signature(k.feature_list) is not None and abs(k.omega) <= 1e-11 and
+               signature(k.feature_list, nraw) is not None and abs(k.omega) <= 1e-11 and
                k._mul_basefunc in _CODES and k._add_basefunc in (*_CODES, None) and
                all(type(ev) is RBFEvaluator and
                    np.array_equal(ev._indexes, np.arange(k.N1)) for ev in k.fevals)

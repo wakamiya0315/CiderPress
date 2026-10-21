@@ -308,7 +308,7 @@ class MappedXC2:
         if use_gpu("semilocal") and use_gpu("rbf") and use_gpu("libxc"):
             from ciderpress.gpu.semilocal import evaluate, supported
 
-            if X0T.shape[0] in (1, 2) and X0T.dtype == np.float64 and supported(self):
+            if X0T.shape[0] in (1, 2) and X0T.dtype == np.float64 and supported(self, X0T.shape[1]):
                 return evaluate(self, X0T, rho_tuple, rhocut)
         vrho_tuple = tuple([np.zeros_like(r, order="F") for r in rho_tuple])
         res, dres = 0, 0

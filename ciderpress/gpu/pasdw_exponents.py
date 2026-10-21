@@ -3,14 +3,15 @@ import numpy as np
 from functools import lru_cache
 
 from ciderpress.gpu import cupy
+from ciderpress.gpu.pasdw import _checked_size
 
 
 _SOURCE = r'''
 extern "C" __global__ void arguments(
-    const double* rho, double* out, int* large, int ng, int mgga,
+    const double* rho, double* out, int* large, long long ng, long long mgga,
     double rhocut, double b, double c, double grad, double cut,
-    int smooth, int etb, double ratio, double inva, double scale, int sizem1) {
-    int g = blockDim.x*blockIdx.x + threadIdx.x;
+    long long smooth, long long etb, double ratio, double inva, double scale, long long sizem1) {
+    long long g = (long long)blockDim.x*blockIdx.x + threadIdx.x;
     if (g >= ng) return;
     double raw = rho[g], n = raw < rhocut ? rhocut : raw;
     bool low = raw < rhocut;
@@ -33,7 +34,7 @@ extern "C" __global__ void arguments(
     if (low) dn = ds = dt = 0;
     if (smooth) {
         double x = a/cut, power = 1, total = 0, dtotal = 0;
-        for (int m = 1; m <= 12; m++) {
+        for (long long m = 1; m <= 12; m++) {
             dtotal += power;
             power *= x;
             total += power/m;
@@ -63,12 +64,12 @@ extern "C" __global__ void arguments(
 extern "C" __global__ void theta_potential(
     const double* x, const double* rho, const double* arg, const double* fun,
     const double* da, const double* df, const double* table, double* v,
-    int ng, int nq, int nx) {
-    int g = blockDim.x*blockIdx.x + threadIdx.x;
+    long long ng, long long nq, long long nx) {
+    long long g = (long long)blockDim.x*blockIdx.x + threadIdx.x;
     if (g >= ng) return;
-    int cell = (int)arg[g];
+    long long cell = (long long)arg[g];
     double d = arg[g]-cell, va = 0, vf = 0;
-    for (int q = 0; q < nq; q++) {
+    for (long long q = 0; q < nq; q++) {
         const double* w = table + (cell*nq+q)*4;
         double p = w[0]+d*(w[1]+d*(w[2]+d*w[3]));
         double dp = w[1]+d*(2*w[2]+d*3*w[3]);
@@ -78,7 +79,7 @@ extern "C" __global__ void theta_potential(
     va *= fun[g];
     v[g] += va*da[g] + vf*df[g];
     double tmp = va*da[ng+g] + vf*df[ng+g];
-    for (int j = 1; j < 4; j++) v[j*ng+g] += (2*rho[j*ng+g])*tmp;
+    for (long long j = 1; j < 4; j++) v[j*ng+g] += (2*rho[j*ng+g])*tmp;
     if (nx == 5) v[4*ng+g] += va*da[2*ng+g] + vf*df[2*ng+g];
 }
 '''
@@ -111,12 +112,16 @@ def arguments(plan, rho, i):
     ng = rho.shape[-1]
     out = cp.empty((4 if mgga else 3, ng), dtype=cp.float64)
     large = cp.empty(ng, dtype=cp.int32)
+    _checked_size(*rho.shape)
+    _checked_size(ng, plan.nalpha, 4)
+    if (ng+255)//256 > 2**31-1:
+        raise ValueError("PASDW launch exceeds CUDA grid size")
     if ng:
         _kernel()(((ng+255)//256,), (256,), (
-            rho, out, large, np.int32(ng), np.int32(mgga),
+            rho, out, large, np.int64(ng), np.int64(mgga),
             *(np.float64(v) for v in (plan.rhocut, b, c, g, np.max(plan.alphas))),
-            np.int32(plan._use_smooth_expnt_cutoff), np.int32(plan.alpha_formula == 'etb'),
-            *(np.float64(v) for v in (ratio, inva, scale)), np.int32(plan._spline_size-1)))
+            np.int64(plan._use_smooth_expnt_cutoff), np.int64(plan.alpha_formula == 'etb'),
+            *(np.float64(v) for v in (ratio, inva, scale)), np.int64(plan._spline_size-1)))
     if plan._raise_large_expnt_error and bool(cp.any(large)):
         raise RuntimeError('NLDF exponent is too large! Please increase nalpha/alpha_max.')
     return out[0], tuple(out[j] for j in range(1, len(out)))
@@ -130,9 +135,13 @@ def theta_potential(plan, grid, rho, arg, fun, da, df, out):
     ng, nq = grid.shape
     nx = rho.shape[0]
     assert out.shape == rho.shape and out.dtype == np.float64 and out.flags.c_contiguous
+    _checked_size(*rho.shape)
+    _checked_size(ng, plan.nalpha, 4)
+    if (ng+255)//256 > 2**31-1:
+        raise ValueError("PASDW launch exceeds CUDA grid size")
     if ng:
         _kernel('theta_potential')(((ng+255)//256,), (256,), (
             cp.ascontiguousarray(grid), cp.asarray(rho), cp.asarray(arg), cp.asarray(fun),
             cp.asarray(np.stack(da)), cp.asarray(np.stack(df)), _theta_table(plan), out,
-            np.int32(ng), np.int32(nq), np.int32(nx)))
+            np.int64(ng), np.int64(nq), np.int64(nx)))
     return out

@@ -7,6 +7,9 @@ The ill-conditioned PAW basis fits and all Cholesky solves remain on the CPU.
 
 import ctypes
 from functools import lru_cache
+from collections import OrderedDict
+from math import prod
+from operator import index
 from hashlib import sha256
 
 import numpy as np
@@ -17,70 +20,70 @@ from ciderpress.gpu import cupy
 _SOURCE = r'''
 extern "C" __global__ void rad2orb(
     const double* x, const double* table, const int* shell, const int* lm,
-    double* out, int ns, int nr, int nlm, int nu, int nq) {
-    int t = blockDim.x * blockIdx.x + threadIdx.x;
+    double* out, long long ns, long long nr, long long nlm, long long nu, long long nq) {
+    long long t = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     if (t >= ns * nu * nq) return;
-    int q = t % nq, u = t / nq % nu, s = t / (nq * nu);
+    long long q = t % nq, u = t / nq % nu, s = t / (nq * nu);
     double v = out[t];
-    for (int r = 0; r < nr; r++)
+    for (long long r = 0; r < nr; r++)
         v += table[shell[u] * nr + r] * x[((s * nr + r) * nlm + lm[u]) * nq + q];
     out[t] = v;
 }
 extern "C" __global__ void orb2rad(
     const double* x, const double* table, const int* start, const int* end,
-    const int* ao, double* out, int ns, int nr, int nlm, int nu, int nq) {
-    int t = blockDim.x * blockIdx.x + threadIdx.x;
+    const int* ao, double* out, long long ns, long long nr, long long nlm, long long nu, long long nq) {
+    long long t = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     if (t >= ns * nr * nlm * nq) return;
-    int q = t % nq, L = t / nq % nlm, r = t / (nq * nlm) % nr;
-    int s = t / (nq * nlm * nr), m = L - start[nlm + L];
+    long long q = t % nq, L = t / nq % nlm, r = t / (nq * nlm) % nr;
+    long long s = t / (nq * nlm * nr), m = L - start[nlm + L];
     double v = out[t];
-    for (int j = start[L]; j < end[L]; j++)
+    for (long long j = start[L]; j < end[L]; j++)
         v += table[j * nr + r] * x[(s * nu + ao[j] + m) * nq + q];
     out[t] = v;
 }
 extern "C" __global__ void convolve(
     const double* x, const double* table, double* out,
-    int ns, int nk, int nlm, int nq) {
-    int t = blockDim.x * blockIdx.x + threadIdx.x;
+    long long ns, long long nk, long long nlm, long long nq) {
+    long long t = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     if (t >= ns * nk * nlm * nq) return;
-    int q2 = t % nq, k = t / (nq * nlm) % nk;
-    int base = t - q2;
+    long long q2 = t % nq, k = t / (nq * nlm) % nk;
+    long long base = t - q2;
     double v = 0.0;
-    for (int q1 = 0; q1 < nq; q1++)
+    for (long long q1 = 0; q1 < nq; q1++)
         v += table[(k * nq + q2) * nq + q1] * x[base + q1];
     out[t] = v;
 }
 extern "C" __global__ void coef2rad(
     const double* c, const double* table, const int* lm, double* out,
-    int ns, int nr, int nlm, int ni, int nq) {
-    int t = blockDim.x * blockIdx.x + threadIdx.x;
+    long long ns, long long nr, long long nlm, long long ni, long long nq) {
+    long long t = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     if (t >= ns * nr * nlm * nq) return;
-    int q = t % nq, L = t / nq % nlm, r = t / (nq * nlm) % nr;
-    int s = t / (nq * nlm * nr);
+    long long q = t % nq, L = t / nq % nlm, r = t / (nq * nlm) % nr;
+    long long s = t / (nq * nlm * nr);
     double v = out[t];
-    for (int i = 0; i < ni; i++)
+    for (long long i = 0; i < ni; i++)
         if (lm[i] == L) v += c[(s * ni + i) * nq + q] * table[i * nr + r];
     out[t] = v;
 }
 extern "C" __global__ void rad2coef(
     const double* x, const double* table, const int* lm, double* out,
-    int ns, int nr, int nlm, int ni, int nq) {
-    int t = blockDim.x * blockIdx.x + threadIdx.x;
+    long long ns, long long nr, long long nlm, long long ni, long long nq) {
+    long long t = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     if (t >= ns * ni * nq) return;
-    int q = t % nq, i = t / nq % ni, s = t / (nq * ni);
+    long long q = t % nq, i = t / nq % ni, s = t / (nq * ni);
     double v = 0.0;
-    for (int r = 0; r < nr; r++)
+    for (long long r = 0; r < nr; r++)
         v += table[i * nr + r] * x[((s * nr + r) * nlm + lm[i]) * nq + q];
     out[t] += v;
 }
 extern "C" __global__ void spline_features(
     const double* x, const double* arg, const double* table, double* p,
-    double* feat, double* dfeat, int ng, int nq, int nspin) {
-    int g = blockDim.x * blockIdx.x + threadIdx.x;
+    double* feat, double* dfeat, long long ng, long long nq, long long nspin) {
+    long long g = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     if (g >= ng) return;
-    int cell = (int)arg[g];
+    long long cell = (long long)arg[g];
     double d = arg[g] - cell, v = 0.0, dv = 0.0;
-    for (int q = 0; q < nq; q++) {
+    for (long long q = 0; q < nq; q++) {
         const double* w = table + (cell * nq + q) * 4;
         double f = w[0] + d * (w[1] + d * (w[2] + d * w[3]));
         double df = w[1] + d * (2 * w[2] + d * 3 * w[3]);
@@ -93,22 +96,22 @@ extern "C" __global__ void spline_features(
 }
 extern "C" __global__ void theta_grid(
     const double* arg, const double* fun, const double* table,
-    double* out, int ng, int nq) {
-    int t = blockDim.x * blockIdx.x + threadIdx.x;
+    double* out, long long ng, long long nq) {
+    long long t = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     if (t >= ng*nq) return;
-    int g = t/nq, q = t%nq, cell = (int)arg[g];
+    long long g = t/nq, q = t%nq, cell = (long long)arg[g];
     double d = arg[g]-cell;
     const double* w = table + (cell*nq+q)*4;
     out[t] = (w[0] + d*(w[1] + d*(w[2] + d*w[3]))) * fun[g];
 }
 extern "C" __global__ void theta_adjoint(
     const double* x, const double* arg, const double* fun, const double* table,
-    double* dedarg, double* dedfun, int ng, int nq) {
-    int g = blockDim.x * blockIdx.x + threadIdx.x;
+    double* dedarg, double* dedfun, long long ng, long long nq) {
+    long long g = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     if (g >= ng) return;
-    int cell = (int)arg[g];
+    long long cell = (long long)arg[g];
     double d = arg[g]-cell, v = 0.0, dv = 0.0;
-    for (int q = 0; q < nq; q++) {
+    for (long long q = 0; q < nq; q++) {
         const double* w = table + (cell*nq+q)*4;
         double p = w[0] + d*(w[1] + d*(w[2] + d*w[3]));
         double dp = w[1] + d*(2*w[2] + d*3*w[3]);
@@ -156,9 +159,12 @@ def _cached(owner, name, signature, build):
     key = cp.cuda.Device().id, signature
     cache = getattr(owner, '_pasdw_device_cache', None)
     if cache is None:
-        cache = owner._pasdw_device_cache = {}
+        cache = owner._pasdw_device_cache = OrderedDict()
     if name not in cache or cache[name][0] != key:
         cache[name] = key, build(cp)
+    cache.move_to_end(name)
+    while len(cache) > 32:
+        cache.popitem(last=False)
     return cache[name][1]
 
 
@@ -167,7 +173,23 @@ def _kernel(name):
     return cupy().RawKernel(_SOURCE, name, options=('--fmad=false',))
 
 
+def _checked_size(*dimensions):
+    dims = tuple(index(d) for d in dimensions)
+    limit = np.iinfo(np.int64).max // 8
+    if any(d < 0 or d > limit for d in dims) or prod(dims) > limit:
+        raise ValueError('PASDW dimensions exceed signed 64-bit byte addressing')
+    return prod(dims)
+
+
 def _launch(name, size, args):
+    _checked_size(size)
+    for arg in args:
+        if hasattr(arg, 'shape') and arg.shape:
+            _checked_size(*arg.shape)
+        elif isinstance(arg, np.int64):
+            _checked_size(int(arg))
+    if (size + 255) // 256 > 2**31 - 1:
+        raise ValueError('PASDW launch exceeds CUDA grid size')
     if size:
         _kernel(name)(((size + 255) // 256,), (256,), args)
 
@@ -211,7 +233,7 @@ def _contract(tables, x, ns, nr, nlm, nu, nq, to_orb, initial=None):
     dx = _device_array(x)
     shape = (ns, nu, nq) if to_orb else (ns, nr, nlm, nq)
     out = cp.zeros(shape, dtype=cp.float64) if initial is None else cp.array(initial)
-    ints = tuple(np.int32(i) for i in (ns, nr, nlm, nu, nq))
+    ints = tuple(np.int64(i) for i in (ns, nr, nlm, nu, nq))
     if to_orb:
         _launch('rad2orb', out.size, (dx, table, shell, lm, out, *ints))
     else:
@@ -232,11 +254,27 @@ def radial(owner, atco, r, nlm, x, to_orb):
     def build(cp):
         nbas = len(bas)
         table = np.empty((nbas, len(r)))
-        libcider.tabulate_pasdw_radial(atco.atco_c_ptr, _ptr(r),
+        _checked_size(nbas, len(r))
+        if len(r) > np.iinfo(np.int32).max:
+            raise ValueError('PASDW radial dimension exceeds C int ABI')
+        status = libcider.tabulate_pasdw_radial(atco.atco_c_ptr, _ptr(r),
                                       ctypes.c_int(len(r)), _ptr(table))
+        if status != 0:
+            raise ValueError('Invalid PASDW radial table dimensions')
         return _tables(cp, table, ls, nlm)
-    # Several atco/radial grids coexist on each contribution object.
-    tables = _cached(owner, ('radial', id(atco), len(r)), signature, build)
+    # Semantic slots survive table replacement without retaining old object
+    # IDs, while the distinct input/reciprocal/feature bases can coexist.
+    slot = ('other', to_orb)
+    for name in ('atco_inp', '_atco_recip', 'atco_feat'):
+        if getattr(owner, name, None) is atco:
+            slot = name
+            break
+    else:
+        for name in ('pcol', 'jcol'):
+            if getattr(getattr(owner, name, None), 'atco_recip', None) is atco:
+                slot = (name, 'reciprocal')
+                break
+    tables = _cached(owner, ('radial', slot), signature, build)
     ns, nq, nr, nu = len(x), x.shape[-1], len(r), atco.nao
     return _contract(tables, x, ns, nr, nlm, nu, nq, to_orb)
 
@@ -285,7 +323,7 @@ def coefficients(owner, x, out, to_radial, check_q=True, use_ffuncs=False, _nlm=
     device = isinstance(x, cp.ndarray)
     dx = _device_array(x)
     _launch('coef2rad' if to_radial else 'rad2coef', dest.size,
-            (dx, *tables, dest, *(np.int32(i) for i in (ns, nr, nlm, ni, nq))))
+            (dx, *tables, dest, *(np.int64(i) for i in (ns, nr, nlm, ni, nq))))
     if device:
         if out is not None:
             out[:] = dest
@@ -313,7 +351,7 @@ def contract_gradient(owner, rgd, n_qg, dndr_qg, dedn_sg, dedgrad_svg, nlm):
             n_qg * (rgd.dr_g * rgd.r_g),
             (4*np.pi) * weight_n[:, None, None] * rnablaY_nLv[:, :nlm], R_nv))
     n, dn, y, nr, dy, directions = _cached(
-        owner, ('gradient', id(n_qg), id(dndr_qg), nlm), signature, build
+        owner, ('gradient', n_qg is owner.xcc.n_qg), signature, build
     )
     ns, nn = len(dedn_sg), len(weight_n)
     rho = cp.asarray(dedn_sg).reshape(ns, -1, nn)
@@ -358,17 +396,23 @@ def reciprocal_convolution(owner, x, rgd, alphas, norms):
     signature = _signature(k, alphas, norms)
     def build(cp):
         table = np.empty((len(k), len(alphas), len(alphas)))
-        libcider.tabulate_pasdw_convolution(_ptr(k), _ptr(alphas), _ptr(norms),
+        _checked_size(len(k), len(alphas), len(alphas))
+        if max(len(k), len(alphas)) > np.iinfo(np.int32).max:
+            raise ValueError('PASDW convolution dimension exceeds C int ABI')
+        status = libcider.tabulate_pasdw_convolution(_ptr(k), _ptr(alphas), _ptr(norms),
             ctypes.c_int(len(k)), ctypes.c_int(len(alphas)), _ptr(table))
+        if status != 0:
+            raise ValueError('Invalid PASDW convolution table dimensions')
         return cp.asarray(table)
-    table = _cached(owner, ('convolution', len(alphas)), signature, build)
+    table = _cached(owner, ('convolution', alphas is getattr(owner, '_galphas', None)),
+                    signature, build)
     cp = cupy()
     device = isinstance(x, cp.ndarray)
     dx = _device_array(x)
     out = cp.empty_like(dx)
     assert x.shape[1] == len(k) and x.shape[-1] == len(alphas)
     _launch('convolve', out.size, (dx, table, out,
-            *(np.int32(i) for i in x.shape)))
+            *(np.int64(i) for i in x.shape)))
     return out if device else cp.asnumpy(out)
 
 
@@ -485,7 +529,7 @@ def theta_grid(plan, arg, fun, _device=False):
     cp = cupy()
     out = cp.empty((arg.size, plan.nalpha))
     _launch('theta_grid', out.size, (cp.asarray(arg), cp.asarray(fun), _theta_table(plan),
-                                   out, np.int32(arg.size), np.int32(plan.nalpha)))
+                                   out, np.int64(arg.size), np.int64(plan.nalpha)))
     return out if _device else cp.asnumpy(out)
 
 
@@ -493,7 +537,7 @@ def theta_adjoint(plan, x, arg, fun):
     cp = cupy()
     da, df = cp.empty(arg.size), cp.empty(arg.size)
     _launch('theta_adjoint', arg.size, (cp.asarray(x), cp.asarray(arg), cp.asarray(fun),
-            _theta_table(plan), da, df, np.int32(arg.size), np.int32(plan.nalpha)))
+            _theta_table(plan), da, df, np.int64(arg.size), np.int64(plan.nalpha)))
     return cp.asnumpy(da), cp.asnumpy(df)
 
 
@@ -555,7 +599,7 @@ class _DevicePlan:
                                    lambda cp: cp.asarray(table))
             p = cp.empty_like(dx)
             _launch('spline_features', ng, (dx, cp.asarray(arg), device_table, p,
-                    values[i], derivs[i], np.int32(ng), np.int32(nq), np.int32(self.base.nspin)))
+                    values[i], derivs[i], np.int64(ng), np.int64(nq), np.int64(self.base.nspin)))
             self.p[spin].append(p)
         feat[:] = cp.asnumpy(values)
         dfeat[:] = cp.asnumpy(derivs)

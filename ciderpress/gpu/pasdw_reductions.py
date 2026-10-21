@@ -149,7 +149,7 @@ def finish(contrib, values, energy=False, _tables=None):
         terms.append(contract_gradient(contrib, x.rgd, n, dn, flat[:, 0], flat[:, 1:4], x.Lmax))
         if v.shape[2] == 5:
             if _tables is None:
-                table = _cached(contrib, ('kinetic_batch', id(tau)), _signature(tau, contrib.w_g),
+                table = _cached(contrib, ('kinetic_batch', tau is x.tau_pg), _signature(tau, contrib.w_g),
                                 lambda cp: (cp.asarray(tau), cp.asarray(contrib.w_g)))
             else:
                 table = _tables['tau_pg' if tau is x.tau_pg else 'taut_pg'], _tables['weights']
