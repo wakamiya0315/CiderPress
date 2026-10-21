@@ -82,9 +82,18 @@ plan reconstructs the original threshold before applying the new spin count.
 Meta-GGA feature exponents are evaluated with spin-scaled density, squared
 gradient and kinetic density, followed by the corresponding chain rule for
 their derivatives.  This keeps mathematically equivalent spin representations
-on the same arithmetic path and avoids amplification of tiny exponent
-differences in subsequent atomic projections.  Fixed-input representation
-checks do not replace magnetic SCF convergence or magnetic force validation.
+on the same exponent arithmetic path.  The full atomic and nonlocal evaluation
+can still amplify rounding differences in its inputs: fixed-input checks have
+shown kinetic-density-potential differences of order 1e-8 between equivalent
+spin representations.  A single successful comparison does not establish
+uniform 1e-10 agreement across numerical layouts.  Representation checks,
+magnetic SCF convergence and magnetic force validation are separate requirements.
+
+The smooth exponent saturation evaluates ``1 - exp(-t)`` through
+``-expm1(-t)`` to retain small values without cancellation.  Its polynomial,
+cutoff and analytic derivative are unchanged.  Rebuild the native library to
+use this change.  Improved scalar arithmetic alone does not guarantee that
+the complete energy/derivative calculation meets a requested accuracy.
 
 Why PAW needs PASDW
 -------------------
