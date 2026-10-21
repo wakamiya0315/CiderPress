@@ -7,6 +7,8 @@ from gpaw.mpi import world
 
 from ciderpress.gpaw.calculator import CiderGPAW, get_cider_functional
 
+pytest.importorskip('gpaw.tau_mixing')
+
 
 @pytest.mark.skipif(world.size != 1, reason="Serial trajectory regression")
 def test_tau_provider_trajectory(tmp_path, monkeypatch):
