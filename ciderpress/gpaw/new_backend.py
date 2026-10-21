@@ -219,6 +219,11 @@ class CiderNewMGGAFunctional(MGGAFunctional):
             from gpaw.gpu import cupy
             if xp is not cupy:
                 raise NotImplementedError('New CIDER supports numpy or GPAW cupy only')
+            # Real CuPy only (never GPAW's fake cpupy): enable the optional
+            # GPU kernels behind the engine's NumPy interfaces.
+            if getattr(xp, '__name__', '') == 'cupy':
+                from ciderpress import gpu as cider_gpu
+                cider_gpu.enable()
         if grid.comm.size != 1:
             raise NotImplementedError('New CIDER does not support domain parallelism')
         old = MGGA(LibXC('PBE'), stencil=2)
