@@ -435,7 +435,9 @@ class _CiderBase:
                     # ensure initialization for calculating potential
                     self.wfs.calculate_kinetic_energy_density()
             else:
-                taut_sG = self.wfs.calculate_kinetic_energy_density()
+                get_tau = getattr(self, "get_kinetic_energy_density",
+                                  self.wfs.calculate_kinetic_energy_density)
+                taut_sG = get_tau()
 
             if taut_sG is None:
                 taut_sG = self.wfs.gd.zeros(len(n_sg))

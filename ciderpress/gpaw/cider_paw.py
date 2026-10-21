@@ -586,7 +586,9 @@ class CiderMGGAPASDW(CiderPASDW_MPRoutines, CiderMGGA):
                     # ensure initialization for calculation potential
                     self.wfs.calculate_kinetic_energy_density()
             else:
-                taut_sG = self.wfs.calculate_kinetic_energy_density()
+                get_tau = getattr(self, "get_kinetic_energy_density",
+                                  self.wfs.calculate_kinetic_energy_density)
+                taut_sG = get_tau()
 
             if taut_sG is None:
                 taut_sG = self.wfs.gd.zeros(len(n_sg))
@@ -626,6 +628,9 @@ class CiderMGGAPASDW(CiderPASDW_MPRoutines, CiderMGGA):
                 self.ekin -= self.wfs.gd.integrate(
                     self.dedtaut_sG[s] * (taut_sG[s] - self.tauct_G / self.wfs.nspins)
                 )
+            state = getattr(self.dens, "tau_state", None)
+            if state is not None:
+                self.record_kinetic_density_state(taut_sg)
 
     def calculate_force_contribs(self, F_av, n_sg):
         e_g = np.zeros(n_sg.shape[1:])
