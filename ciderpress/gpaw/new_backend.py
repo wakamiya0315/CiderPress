@@ -39,12 +39,20 @@ from ciderpress.dft.model_utils import (
 )
 from ciderpress.gpaw.cider_fft import (
     _CiderBase,
-    add_gradient_correction,
+    add_gradient_correction as _cpu_gradient_correction,
 )
 from ciderpress.gpaw.cider_kernel import CiderMGGAHybridKernel
 from ciderpress.gpaw.cider_paw import CiderPASDW_MPRoutines
 from ciderpress.gpaw.config import GPAW_DEFAULT_RHO_TOL
 from ciderpress.gpaw.nldf_interface import pwutil
+
+
+def add_gradient_correction(grad_v, dedrho_sxg, v_sg):
+    from ciderpress.gpu import use_gpu
+    if use_gpu('fine_grid'):
+        from ciderpress.gpu.fine_grid import add_correction
+        return add_correction(grad_v, dedrho_sxg, v_sg)
+    return _cpu_gradient_correction(grad_v, dedrho_sxg, v_sg)
 
 
 @lru_cache(maxsize=1)
@@ -171,12 +179,25 @@ class _SerialAtomDist:
         return a
 
 
+class _GridHybridKernel(CiderMGGAHybridKernel):
+    def call_xc_kernel(self, e_g, n_sg, sigma_xg, feat_sg, v_sg,
+                       dedsigma_xg, vfeat_sg, tau_sg=None, dedtau_sg=None):
+        args = (e_g, n_sg, sigma_xg, feat_sg, v_sg, dedsigma_xg, vfeat_sg)
+        kwargs = dict(tau_sg=tau_sg, dedtau_sg=dedtau_sg)
+        from ciderpress.gpu import use_gpu
+        if use_gpu('grid_xc') and use_gpu('semilocal'):
+            from ciderpress.gpu.grid_xc import evaluate, supported
+            if supported(self):
+                return evaluate(self, *args, **kwargs)
+        return super().call_xc_kernel(*args, **kwargs)
+
+
 class _Engine(CiderPASDW_MPRoutines, _CiderBase):
     """Compose the unchanged Classic numerical engine, without Classic MGGA."""
 
     def __init__(self, param, grid, grad_v):
         opts = param.options
-        kernel = CiderMGGAHybridKernel(param.mlfunc, opts['xmix'],
+        kernel = _GridHybridKernel(param.mlfunc, opts['xmix'],
                                       opts['xkernel'], opts['ckernel'])
         _CiderBase.__init__(self, kernel, Nalpha=opts['Nalpha'],
                             lambd=opts['lambd'], encut=opts['qmax'],
@@ -204,6 +225,32 @@ class _Engine(CiderPASDW_MPRoutines, _CiderBase):
             nalpha += 1
         self.initialize_paw_kernel(self.cider_kernel, nalpha, encut)
 
+    def _get_cider_inputs(self, n_sg, taut_sg):
+        from ciderpress.gpu import use_gpu
+        if use_gpu('fine_grid'):
+            from ciderpress.gpu.fine_grid import get_rho
+            rho = get_rho(n_sg, self.grad_v, taut_sg)
+            self.nspin = len(rho)
+            return np.zeros(n_sg.shape[1:]), rho, np.zeros_like(rho)
+        return super()._get_cider_inputs(n_sg, taut_sg)
+
+    def call_fwd(self, rho_tuple, grad_mode=0):
+        from ciderpress.gpu.grid_nldf import forward, supported
+        if supported(self, grad_mode):
+            return forward(self, rho_tuple)
+        return super().call_fwd(rho_tuple, grad_mode=grad_mode)
+
+    def call_bwd(self, rho_tuple, vfeat_sig, dfeat_sjg, arg_sg, fun_sg,
+                 v_sg, dedsigma_xg, dedtau_sg, p_gq=None, dp_gq=None,
+                 grad_mode=0):
+        from ciderpress.gpu.grid_nldf import backward, supported
+        if supported(self, grad_mode):
+            return backward(self, rho_tuple, vfeat_sig, dfeat_sjg, arg_sg,
+                            fun_sg, v_sg, dedsigma_xg, dedtau_sg, p_gq, dp_gq)
+        return super().call_bwd(rho_tuple, vfeat_sig, dfeat_sjg, arg_sg,
+                               fun_sg, v_sg, dedsigma_xg, dedtau_sg,
+                               p_gq=p_gq, dp_gq=dp_gq, grad_mode=grad_mode)
+
 
 class CiderNewMGGAFunctional(MGGAFunctional):
     """Fine-grid CIDER XC. See the module's term-counting table.
@@ -228,8 +275,8 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         old = MGGA(LibXC('PBE'), stencil=2)
         old.type = 'MGGA'
         old.name = 'CIDER26XCSURFSCI'
-        # MGGA's wrapper and finite-difference gradient kernels must stay on
-        # numpy even when calculate() is fed device arrays in a later phase.
+        # Keep the reference MGGA/Gradient objects on NumPy. Optional device
+        # stencils reuse their exact coefficients behind the NumPy boundary.
         super().__init__(old, grid)
         self.xp = xp
         self.param = param

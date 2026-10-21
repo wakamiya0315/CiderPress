@@ -9,7 +9,7 @@ import numpy as np
 
 from ciderpress.gpu import cupy
 from ciderpress.gpu.descriptors import backward, forward, signature
-from ciderpress.gpu.libxc import evaluate_device
+from ciderpress.gpu.libxc import evaluate_device as _libxc_device
 from ciderpress.gpu.rbf import _kernel, _model
 
 _CODES = {"LDA_X": 1, "GGA_X_PBE": 101, "GGA_C_PBE": 130}
@@ -33,7 +33,7 @@ def _baseline(name, rho_tuple, sep):
     code = _CODES[name]
 
     def evaluate(rho, sigma):
-        e, v, w = evaluate_device(code, rho, sigma)
+        e, v, w = _libxc_device(code, rho, sigma)
         e *= rho.sum(0)
         return (e, v) if code == 1 else (e, v, w)
 
@@ -57,6 +57,16 @@ def evaluate(model, X0T, rho_tuple, rhocut):
     cp = cupy()
     x = cp.asarray(np.ascontiguousarray(X0T))
     rho = tuple(cp.asarray(r) for r in rho_tuple)
+    res, dres, vrho = evaluate_device(model, x, rho, rhocut)
+    # The NumPy interface includes shape/order and independent returned arrays.
+    host_dres = np.empty_like(X0T)
+    host_dres[...] = dres.get()
+    return res.get(), host_dres, tuple(np.asfortranarray(v.get()) for v in vrho)
+
+
+def evaluate_device(model, x, rho, rhocut):
+    """Private resident pipeline; public evaluate retains its NumPy API."""
+    cp = cupy()
     vrho = tuple(cp.zeros_like(r, order="F") for r in rho)
     ns, nraw, n = x.shape
     res, dres = 0, 0
@@ -102,7 +112,4 @@ def evaluate(model, X0T, rho_tuple, rhocut):
             dtmp /= ns
         res += f
         dres += dtmp
-    # The NumPy interface includes shape/order and independent returned arrays.
-    host_dres = np.empty_like(X0T)
-    host_dres[...] = dres.get()
-    return res.get(), host_dres, tuple(np.asfortranarray(v.get()) for v in vrho)
+    return res, dres, vrho
