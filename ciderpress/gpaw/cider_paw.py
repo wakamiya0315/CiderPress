@@ -625,6 +625,10 @@ class CiderMGGAPASDW(CiderPASDW_MPRoutines, CiderMGGA):
             self.ekin = 0.0
             for s in range(self.wfs.nspins):
                 self.restrict_and_collect(dedtaut_sg[s], self.dedtaut_sG[s])
+            project = getattr(self, "symmetrize_grid_derivative", None)
+            if project is not None:
+                project(self.dedtaut_sG)
+            for s in range(self.wfs.nspins):
                 self.ekin -= self.wfs.gd.integrate(
                     self.dedtaut_sG[s] * (taut_sG[s] - self.tauct_G / self.wfs.nspins)
                 )
