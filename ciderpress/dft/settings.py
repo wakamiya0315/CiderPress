@@ -85,16 +85,24 @@ def get_cider_exponent(
         rho = np.asarray([rho], dtype=np.float64)
         sigma = np.asarray([sigma], dtype=np.float64)
         tau = np.asarray([tau], dtype=np.float64)
+    if nspin == 2:
+        # Share the complete numerical path, including cutoff evaluation.
+        # Preserve the existing below-cutoff writes to caller work arrays.
+        value, dn, ds, dt = get_cider_exponent(
+            2 * rho, 4 * sigma, 2 * tau, a0=a0, grad_mul=grad_mul,
+            tau_mul=tau_mul, rhocut=2 * rhocut, nspin=1)
+        cond = rho < rhocut
+        sigma[cond] = 0
+        tau[cond] = 0
+        result = value, 2 * dn, 4 * ds, 2 * dt
+        return result if isarray else tuple(x.item() for x in result)
     tau_fac = tau_mul * 1.2 * (6 * np.pi**2) ** (2.0 / 3) / np.pi
     cond = rho < rhocut
     rho = rho.copy()
     rho[cond] = rhocut
     sigma[cond] = 0
     tau[cond] = 0
-    if nspin == 1:
-        B = np.pi / 2 ** (2.0 / 3) * (a0 - tau_fac)
-    else:
-        B = np.pi * (a0 - tau_fac)
+    B = np.pi / 2 ** (2.0 / 3) * (a0 - tau_fac)
     C = np.pi / 2 ** (2.0 / 3) * tau_fac / CFC
     ascale = B * rho ** (2.0 / 3) + C * tau / rho
     dadrho = 2 * B / (3 * rho ** (1.0 / 3)) - (C * tau / rho) / rho

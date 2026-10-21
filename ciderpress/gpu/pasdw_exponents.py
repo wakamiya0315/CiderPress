@@ -7,21 +7,33 @@ from ciderpress.gpu.pasdw import _checked_size
 
 
 _SOURCE = r'''
+__device__ double saturate_exponent(double a, double cut, double &derivative) {
+    double x = a/cut, power = 1, total = 0, dtotal = 0;
+    for (long long m = 1; m <= 12; m++) {
+        dtotal += power;
+        power *= x;
+        total += power/m;
+    }
+    derivative = exp(-total)*dtotal;
+    return -cut*expm1(-total);
+}
 extern "C" __global__ void arguments(
     const double* rho, double* out, int* large, long long ng, long long mgga,
-    double rhocut, double b, double c, double grad, double cut,
+    double rhocut, double b, double c, double grad, double cut, long long spin_scale,
     long long smooth, long long etb, double ratio, double inva, double scale, long long sizem1) {
     long long g = (long long)blockDim.x*blockIdx.x + threadIdx.x;
     if (g >= ng) return;
-    double raw = rho[g], n = raw < rhocut ? rhocut : raw;
+    double raw = rho[g];
     bool low = raw < rhocut;
+    double n = (double)spin_scale*(low ? rhocut : raw);
     double sigma = rho[ng+g]*rho[ng+g] + rho[2*ng+g]*rho[2*ng+g];
     sigma += rho[3*ng+g]*rho[3*ng+g];
+    if (spin_scale == 2) sigma *= 4;
     if (low) sigma = 0;
     double a = b*pow(n, 2.0/3.0), dn = 2*b/(3*pow(n, 1.0/3.0));
     double ds = 0, dt = 0;
     if (mgga) {
-        double tau = low ? 0 : rho[4*ng+g];
+        double tau = low ? 0 : (double)spin_scale*rho[4*ng+g];
         a += c*tau/n;
         dn -= (c*tau/n)/n;
         dt = c/n;
@@ -31,16 +43,11 @@ extern "C" __global__ void arguments(
         ds = grad/(n*n);
         dn -= 2*grad*sigma/(n*n*n);
     }
+    if (spin_scale == 2) { dn *= 2; ds *= 4; dt *= 2; }
     if (low) dn = ds = dt = 0;
     if (smooth) {
-        double x = a/cut, power = 1, total = 0, dtotal = 0;
-        for (long long m = 1; m <= 12; m++) {
-            dtotal += power;
-            power *= x;
-            total += power/m;
-        }
-        double ex = exp(-total), derivative = ex*dtotal;
-        a = cut*(1-ex);
+        double derivative;
+        a = saturate_exponent(a, cut, derivative);
         dn *= derivative; ds *= derivative; dt *= derivative;
     }
     large[g] = raw > rhocut && a > cut;
@@ -101,8 +108,11 @@ def arguments(plan, rho, i):
     a0, grad_mul = params[:2]
     tau_mul = params[2] if mgga else 0.
     tau_fac = tau_mul*1.2*(6*np.pi**2)**(2./3)/np.pi
-    b = np.pi/(2**(2./3) if plan.nspin == 1 else 1.)*(a0-tau_fac)
+    b = np.pi/2**(2./3)*(a0-tau_fac)
     c = np.pi/2**(2./3)*tau_fac/CFC
+    spin_scale = plan.nspin if mgga else 1
+    if not mgga:
+        b = np.pi/(2**(2./3) if plan.nspin == 1 else 1.)*a0
     g = 0.
     if grad_mul != 0:
         g = grad_mul*1.2*(6*np.pi**2)**(2./3)/np.pi
@@ -120,7 +130,7 @@ def arguments(plan, rho, i):
         _kernel()(((ng+255)//256,), (256,), (
             rho, out, large, np.int64(ng), np.int64(mgga),
             *(np.float64(v) for v in (plan.rhocut, b, c, g, np.max(plan.alphas))),
-            np.int64(plan._use_smooth_expnt_cutoff), np.int64(plan.alpha_formula == 'etb'),
+            np.int64(spin_scale), np.int64(plan._use_smooth_expnt_cutoff), np.int64(plan.alpha_formula == 'etb'),
             *(np.float64(v) for v in (ratio, inva, scale)), np.int64(plan._spline_size-1)))
     if plan._raise_large_expnt_error and bool(cp.any(large)):
         raise RuntimeError('NLDF exponent is too large! Please increase nalpha/alpha_max.')

@@ -486,7 +486,7 @@ inline double _expnt_sat_func(double x, double cut) {
         xm *= x;
         tot += xm / m;
     }
-    return cut * (1 - exp(-tot));
+    return -cut * expm1(-tot);
 }
 
 inline double _expnt_sat_deriv(double x, double cut) {

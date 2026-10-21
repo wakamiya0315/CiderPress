@@ -455,6 +455,14 @@ class _PAWCiderContribs:
     def get_kinetic_energy(self, ae, D_sp=None):
         D_sp = self._D_sp if D_sp is None else D_sp
         nspins = D_sp.shape[0]
+        if nspins == 2:
+            # Use the same contraction and core arithmetic for both spin
+            # representations. The scaling cancels in the linear valence
+            # term and divides the core contribution between the channels.
+            return np.concatenate([
+                self.get_kinetic_energy(ae, D_sp=2 * row[None])
+                for row in D_sp
+            ], axis=0) / 2
         xcc = self.xcc
         if ae:
             tau_pg = xcc.tau_pg
