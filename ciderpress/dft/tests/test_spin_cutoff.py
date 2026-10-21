@@ -6,7 +6,7 @@ import pytest
 
 from ciderpress.dft.xc_evaluator2 import MappedDFTKernel2
 from ciderpress.dft.plans import NLDFSplinePlan
-from ciderpress.dft.settings import NLDFSettingsVJ
+from ciderpress.dft.settings import NLDFSettingsVJ, get_cider_exponent
 
 
 def linear_separate_kernel():
@@ -72,3 +72,28 @@ def test_plan_copy_preserves_density_gate(nspin):
         np.testing.assert_array_equal(gradient, derivatives)
     switched = plan.new(nspin=3-nspin)
     assert switched.rhocut * switched.nspin == plan.rhocut * plan.nspin
+
+
+@pytest.mark.parametrize('grad_mul', [0., .2])
+def test_exponent_spin_scaling_and_chain_rule(grad_mul):
+    rho = np.array([.25e-8, .75e-8, 1.5e-8, .1, 1., 100.])
+    sigma = .3 * rho**2
+    tau = .5 * rho**(5/3)
+    one = get_cider_exponent(rho.copy(), sigma.copy(), tau.copy(),
+                            grad_mul=grad_mul, nspin=1, rhocut=1e-8)
+    two = get_cider_exponent(rho/2, sigma/4, tau/2,
+                            grad_mul=grad_mul, nspin=2, rhocut=.5e-8)
+    for reference, actual, factor in zip(one, two, [1, 2, 4, 2]):
+        np.testing.assert_array_equal(actual, factor * reference)
+    # A polarized, active channel also obeys the analytic chain rule.
+    inputs = [rho[-3:]/3, sigma[-3:]/7, tau[-3:]/4]
+    base = get_cider_exponent(*[x.copy() for x in inputs], grad_mul=grad_mul,
+                             nspin=2, rhocut=.5e-8)
+    for index in range(3):
+        step = 1e-5 * inputs[index]
+        plus, minus = [x.copy() for x in inputs], [x.copy() for x in inputs]
+        plus[index] += step
+        minus[index] -= step
+        numeric = (get_cider_exponent(*plus, grad_mul=grad_mul, nspin=2)[0]
+                   - get_cider_exponent(*minus, grad_mul=grad_mul, nspin=2)[0]) / (2*step)
+        np.testing.assert_allclose(numeric, base[index+1], atol=1e-9, rtol=1e-8)

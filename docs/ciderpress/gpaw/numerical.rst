@@ -70,6 +70,22 @@ The interpolation controls ``qmax``, ``lambd``, and ``Nalpha`` define the
 numerical representation of the density-dependent kernel. Energy, potential,
 force, and stress calculations being compared must use the same controls.
 
+Collinear spin representation
+-----------------------------
+
+The separate-spin mapped evaluator applies its density gate to
+``nspin * rho_spin``.  The numerical threshold and trained parameters are
+unchanged when an unpolarized density is represented with two equal spin
+channels.  Auxiliary plans store a per-spin threshold internally; copying a
+plan reconstructs the original threshold before applying the new spin count.
+
+Meta-GGA feature exponents are evaluated with spin-scaled density, squared
+gradient and kinetic density, followed by the corresponding chain rule for
+their derivatives.  This keeps mathematically equivalent spin representations
+on the same arithmetic path and avoids amplification of tiny exponent
+differences in subsequent atomic projections.  Fixed-input representation
+checks do not replace magnetic SCF convergence or magnetic force validation.
+
 Why PAW needs PASDW
 -------------------
 

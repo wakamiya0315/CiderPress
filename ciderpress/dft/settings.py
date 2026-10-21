@@ -91,10 +91,13 @@ def get_cider_exponent(
     rho[cond] = rhocut
     sigma[cond] = 0
     tau[cond] = 0
-    if nspin == 1:
-        B = np.pi / 2 ** (2.0 / 3) * (a0 - tau_fac)
-    else:
-        B = np.pi * (a0 - tau_fac)
+    if nspin == 2:
+        # Evaluate equivalent spin representations with the same arithmetic.
+        # Tiny exponent differences can be amplified by subsequent projections.
+        rho = nspin * rho
+        sigma = nspin**2 * sigma
+        tau = nspin * tau
+    B = np.pi / 2 ** (2.0 / 3) * (a0 - tau_fac)
     C = np.pi / 2 ** (2.0 / 3) * tau_fac / CFC
     ascale = B * rho ** (2.0 / 3) + C * tau / rho
     dadrho = 2 * B / (3 * rho ** (1.0 / 3)) - (C * tau / rho) / rho
@@ -110,6 +113,10 @@ def get_cider_exponent(
     dadrho[cond] = 0
     dadsigma[cond] = 0
     dadtau[cond] = 0
+    if nspin == 2:
+        dadrho *= nspin
+        dadsigma *= nspin**2
+        dadtau *= nspin
     if not isarray:
         ascale = ascale.item()
         dadrho = dadrho.item()
