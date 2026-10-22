@@ -62,6 +62,7 @@ from ciderpress.gpaw.interp_paw import (
     DiffPAWXCCorrection,
     calculate_cider_paw_correction,
 )
+from ciderpress.gpaw.paw_radial import RadialTransform
 
 USE_GAUSSIAN_PAW_CONV = False
 DEFAULT_CIDER_PAW_ALGO = "v1"
@@ -2297,7 +2298,21 @@ class _PSmoothSetupBase(PASDWData):
 
 
 class PSmoothSetupV1(_PSmoothSetupBase):
+    def _get_radial_transform(self, nlm):
+        if nlm not in self._radial_transforms:
+            self._radial_transforms[nlm] = RadialTransform(
+                self.pcol, self.sbt_rgd, nlm, get_dvk(self.sbt_rgd)
+            )
+        return self._radial_transforms[nlm]
+
+    def k2orb(self, f_skLq):
+        return self._get_radial_transform(f_skLq.shape[2]).forward(f_skLq)
+
+    def orb2k(self, f_suq):
+        return self._get_radial_transform(self._grid_nlm).adjoint(f_suq)
+
     def _initialize(self, atco):
+        self._radial_transforms = {}
         rgd = self.slrgd
         nj = self.nj
         ng = self.ng
