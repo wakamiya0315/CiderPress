@@ -102,27 +102,43 @@ def supported(engine, grad_mode):
             and engine.fft_obj.comm.size == 1)
 
 
+def arguments(plan, rho_tuple, i=-1):
+    """FP64 grid arguments with the original NumPy return/mutation contract.
+
+    The grid already has sigma, so use it directly rather than reconstructing
+    a gradient or taking a square root. The shared PASDW exponent kernel keeps
+    the same saturation, clipping and spin factors. Only transient work is
+    resident; the public argument/derivative arrays remain host arrays.
+    """
+    from ciderpress.gpu.pasdw_exponents import numpy_arguments
+
+    return numpy_arguments(plan, rho_tuple, i)
+
+
 def forward(engine, rho_tuple):
     plan, fft = engine._plan, engine.fft_obj
     engine._set_paw_terms()
-    arg, darg = plan.get_interpolation_arguments(rho_tuple, i=-1)
+    arg, darg = arguments(plan, rho_tuple, i=-1)
     fun, dfun = plan.get_function_to_convolve(rho_tuple)
     features = np.empty((plan.nspin, plan.nldf_settings.nfeat) + arg.shape[1:])
     derivatives = np.empty((plan.nspin, plan.num_vj) + arg.shape[1:])
     work = fft._gpu_work()
     p = dp = None
-    arguments = {}
+    saved_arguments = {}
     # Forward and reverse consume the same immutable density tuple within
     # calc_cider. Retain its CPU exponent derivatives for this one evaluation.
-    engine._grid_nldf_arguments = (rho_tuple, arguments)
+    engine._grid_nldf_arguments = (rho_tuple, saved_arguments)
     for s in range(plan.nspin):
         fill(work, plan, arg[s], fun[s])
         engine.set_fft_work(s, pot=False)
         fft.compute_forward_convolution()
         engine.get_fft_work(s, pot=False)
         for i in range(plan.num_vj):
-            a, deriv = plan.get_interpolation_arguments(tuple(x[s] for x in rho_tuple), i=i)
-            arguments[s, i] = a, deriv
+            if plan.nldf_settings.feat_params[i][:len(plan.nldf_settings.theta_params)] == plan.nldf_settings.theta_params:
+                a, deriv = arg[s], tuple(x[s] for x in darg)
+            else:
+                a, deriv = arguments(plan, tuple(x[s] for x in rho_tuple), i=i)
+            saved_arguments[s, i] = a, deriv
             features[s, i], derivatives[s, i] = contract(work, plan, a, i)
         # Preserve the existing NumPy scratch return values, including layout.
         # One CPU coefficient evaluation replaces all intermediate large copies.
@@ -138,14 +154,14 @@ def backward(engine, rho_tuple, vfeat, dfeat, arg, fun, v, vsigma, vtau,
     engine._calculate_paw_energy_and_potential()
     work = fft._gpu_work()
     saved = engine.__dict__.pop('_grid_nldf_arguments', None)
-    arguments = saved[1] if saved is not None and saved[0] is rho_tuple else {}
+    saved_arguments = saved[1] if saved is not None and saved[0] is rho_tuple else {}
     for s in range(plan.nspin):
         fft.reset_work()
         for i in range(plan.num_vj):
-            if (s, i) in arguments:
-                a, deriv = arguments[s, i]
+            if (s, i) in saved_arguments:
+                a, deriv = saved_arguments[s, i]
             else:
-                a, deriv = plan.get_interpolation_arguments(tuple(x[s] for x in rho_tuple), i=i)
+                a, deriv = arguments(plan, tuple(x[s] for x in rho_tuple), i=i)
             fill(work, plan, a, vfeat[s, i], i=i, add=True)
             tmp = dfeat[s, i] * vfeat[s, i]
             v[s] += deriv[0] * tmp
