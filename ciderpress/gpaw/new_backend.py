@@ -284,11 +284,11 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         # even if construction subsequently fails. CPUPY is always CPU.
         self._device = (xp.cuda.Device().id
                         if getattr(xp, '__name__', '') == 'cupy' else None)
-        from ciderpress.dft.exponent_floor import check_floor_cpu
-        check_floor_cpu(param.options.get('smooth_floor_width', 0.0),
-                        device=self._device)
         if grid.comm.size != 1:
             raise NotImplementedError('New CIDER does not support domain parallelism')
+        from ciderpress.dft.exponent_floor import check_floor_cpu
+        self._smooth_floor_width = param.options.get('smooth_floor_width', 0.0)
+        check_floor_cpu(self._smooth_floor_width, device=self._device)
         old = MGGA(LibXC('PBE'), stencil=2)
         old.type = 'MGGA'
         old.name = 'CIDER26XCSURFSCI'
@@ -400,8 +400,10 @@ class CiderNewMGGAFunctional(MGGAFunctional):
     def calculate(self, nt_sr, taut_sr=None):
         from ciderpress.gpu import policy
         with policy(self._device):
-            from ciderpress.dft.exponent_floor import check_floor_cpu
-            check_floor_cpu(self.param.options.get('smooth_floor_width', 0.0))
+            width = getattr(self, '_smooth_floor_width', 0.0)
+            if width:
+                from ciderpress.dft.exponent_floor import check_floor_cpu
+                check_floor_cpu(width)
             for array in (nt_sr, taut_sr):
                 device = getattr(getattr(array, 'data', None), 'device', None)
                 if self._device is not None and getattr(device, 'id', None) != self._device:
