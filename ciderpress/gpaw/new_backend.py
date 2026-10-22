@@ -388,7 +388,7 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         with policy(self._device):
             for array in (nt_sr, taut_sr):
                 device = getattr(getattr(array, 'data', None), 'device', None)
-                if self._device is not None and device is not None and device.id != self._device:
+                if self._device is not None and getattr(device, 'id', None) != self._device:
                     raise ValueError('New CIDER input differs from its recorded CUDA device')
             return self._calculate(nt_sr, taut_sr)
 
