@@ -2296,7 +2296,13 @@ class NLDFSplinePlan(NLDFAuxiliaryPlan):
         expcut=1e-10,
         raise_large_expnt_error=True,
         use_smooth_expnt_cutoff=False,
+        smooth_floor_width=0.0,
     ):
+        from ciderpress.dft.exponent_floor import validate_floor_width
+
+        self.smooth_floor_width = validate_floor_width(smooth_floor_width)
+        if self.smooth_floor_width and alpha_formula != "etb":
+            raise NotImplementedError("NLDF smooth variant requires etb exponents")
         self._spline_size = nalpha if spline_size is None else spline_size
         self._local_alpha_transform = None
         super(NLDFSplinePlan, self).__init__(
@@ -2313,6 +2319,11 @@ class NLDFSplinePlan(NLDFAuxiliaryPlan):
             raise_large_expnt_error=raise_large_expnt_error,
             use_smooth_expnt_cutoff=use_smooth_expnt_cutoff,
         )
+
+    def new(self, **kwargs):
+        # PASDW radial plans are cloned here with an extended upper basis.
+        kwargs.setdefault("smooth_floor_width", self.smooth_floor_width)
+        return super().new(**kwargs)
 
     def _run_setup(self):
         ovlp, _ = _get_ovlp_fit_interpolation_coefficients(
@@ -2371,6 +2382,22 @@ class NLDFSplinePlan(NLDFAuxiliaryPlan):
         """A fast (parallel C-backend) version of get_a2q that
         also has a local option to get the q values just
         for the local alphas."""
+        if self.smooth_floor_width:
+            from ciderpress.dft.exponent_floor import check_floor_cpu, smooth_floor_q
+
+            check_floor_cpu(self.smooth_floor_width)
+            di, derivi = smooth_floor_q(
+                exp_g, self.alpha0, self.lambd, self.smooth_floor_width
+            )
+            scale = (self._spline_size - 1) / (self.nalpha - 1)
+            di *= scale
+            derivi *= scale
+            # Retain upper-domain protection. The lower branch is absent:
+            # q is nonnegative, with its continuous exact derivative.
+            upper = di >= self._spline_size - 1
+            di[upper] = self._spline_size - 1 - 1e-10
+            derivi[upper] = 0.0
+            return di, derivi
         di = np.empty_like(exp_g)
         derivi = np.empty_like(exp_g)
         if self.alpha_formula == "etb":

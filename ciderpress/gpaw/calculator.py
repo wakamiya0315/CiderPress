@@ -53,6 +53,7 @@ def get_cider_functional(
     qmax=300,
     lambd=1.8,
     _force_nonlocal=False,
+    smooth_floor_width=0.0,
 ):
     """
     Initialize a CIDER surrogate hybrid XC functional of the form::
@@ -127,6 +128,9 @@ def get_cider_functional(
         _force_nonlocal (bool, False): Use nonlocal kernel even if nonlocal
             features are not required. For debugging use only. Do not
             adjust except for testing.
+        smooth_floor_width (float, 0): Opt-in non-official CPU smooth variant
+            of the NLDF lower exponent floor, in units of the smallest basis
+            exponent. Zero retains the official functional exactly.
 
     Returns:
         A _CiderBase object (specific class depends on the parameters
@@ -205,9 +209,11 @@ def get_cider_functional(
             encut=qmax,
             pasdw_ovlp_fit=pasdw_ovlp_fit,
             pasdw_store_funcs=pasdw_store_funcs,
+            smooth_floor_width=smooth_floor_width,
         )
     else:
-        xc = cls(cider_kernel, Nalpha=Nalpha, lambd=lambd, encut=qmax)
+        xc = cls(cider_kernel, Nalpha=Nalpha, lambd=lambd, encut=qmax,
+                 smooth_floor_width=smooth_floor_width)
 
     return xc
 
