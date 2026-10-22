@@ -465,6 +465,10 @@ class CiderNewMGGAFunctional(MGGAFunctional):
 
         New owns projector/dH, core n/tau, Hartree and vbar terms.  In
         particular this never calls Classic MGGA.add_forces or _get_taut.
+        With joint tau mixing, taut_sR is the retained input valence tau
+        plus core, and D_asii is the retained input D.  The checks below
+        compare these to the SCF evaluation, without consulting mixer history
+        or using the unmixed output.  DFT owns convergence/epoch validation.
         No communicator other than the engine's private SELF is entered.
         """
         from ciderpress.gpu import policy
