@@ -340,12 +340,21 @@ class CiderNewMGGAFunctional(MGGAFunctional):
                                               ' parallelism')
         if atomdist.comm.size != 1 or np.any(atomdist.rank_a != 0):
             raise NotImplementedError('New CIDER requires serial atom distribution')
-        if self._relpos is not None and not np.array_equal(relpos_ac, self._relpos):
-            raise NotImplementedError('New CIDER does not support atom moves')
-        self._relpos = np.array(relpos_ac, copy=True)
-        engine = self.engine
         if self.setups is not None and setups is not self.setups:
             raise NotImplementedError('New CIDER does not support replacing setups')
+        if self._relpos is not None and not np.array_equal(relpos_ac, self._relpos):
+            # A new engine owns this geometry's translated s/a slices, global
+            # overlap fits, atomic scratch and device mirrors.  Discarding the
+            # owner also prevents identity-keyed GPU tables/property engines
+            # from surviving a move.  Grid/cell operators remain fixed.
+            self.engine = _Engine(self.param, self.grid, self.grad_v)
+            self.setups = None
+            self._density = None
+            self._paw_ready = False
+            for name in ('_force_engine', '_stress_engine'):
+                self.__dict__.pop(name, None)
+        self._relpos = np.array(relpos_ac, copy=True)
+        engine = self.engine
         if self.setups is None:
             self.setups = setups
             # PASDW writes functional-specific radial plans/contribution caches
