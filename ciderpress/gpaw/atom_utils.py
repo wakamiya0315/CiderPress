@@ -1366,6 +1366,11 @@ class FastPASDWCiderKernel:
         if setups is None:
             setups = self.dens.setups
         for setup in setups:
+            cached = getattr(setup, "cider_contribs", None)
+            if cached is not None and getattr(cached.plan, "smooth_floor_width", 0.0) != getattr(
+                self.plan, "smooth_floor_width", 0.0
+            ):
+                raise ValueError("Cached PASDW smooth variant differs; use fresh setups")
             if not hasattr(setup, "cider_contribs") or setup.cider_contribs is None:
                 setup.xc_correction = DiffPAWXCCorrection.from_setup(
                     setup, build_kinetic=True, ke_order_ng=False

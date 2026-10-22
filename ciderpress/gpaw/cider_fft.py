@@ -44,8 +44,13 @@ class _CiderBase:
     has_paw = False
 
     def __init__(
-        self, cider_kernel, Nalpha=None, lambd=1.8, encut=300, world=None, **kwargs
+        self, cider_kernel, Nalpha=None, lambd=1.8, encut=300, world=None,
+        smooth_floor_width=0.0, **kwargs
     ):
+        from ciderpress.dft.exponent_floor import check_floor_cpu, validate_floor_width
+
+        self.smooth_floor_width = validate_floor_width(smooth_floor_width)
+        check_floor_cpu(self.smooth_floor_width)
         if world is None:
             self.world = mpi.world
         else:
@@ -98,6 +103,8 @@ class _CiderBase:
             "lambd": self.lambd,
             "encut": self.encut,
         }
+        if self.smooth_floor_width:
+            xc_params["smooth_floor_width"] = self.smooth_floor_width
         return {
             "kernel_params": kernel_params,
             "xc_params": xc_params,
@@ -157,6 +164,7 @@ class _CiderBase:
                 rhocut=GPAW_DEFAULT_RHO_TOL,
                 expcut=GPAW_DEFAULT_RHO_TOL,
                 use_smooth_expnt_cutoff=True,
+                smooth_floor_width=self.smooth_floor_width,
             )
         self.fft_obj = LibCiderPW(
             self.aux_gd.N_c, self.aux_gd.cell_cv, self.aux_gd.comm, plan=self._plan
@@ -330,6 +338,10 @@ class _CiderBase:
         dedrho_sxg,
         grad_mode=CIDERPW_GRAD_MODE_NONE,
     ):
+        if self.smooth_floor_width:
+            from ciderpress.dft.exponent_floor import check_floor_cpu
+
+            check_floor_cpu(self.smooth_floor_width)
         nspin = len(rho_sxg)
         self.nspin = nspin
         if not self.is_initialized:

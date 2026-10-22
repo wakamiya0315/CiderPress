@@ -82,14 +82,20 @@ class CiderXC(XC):
     ``object_hooks={'xc': restore_cider_xc}``. Both the requested interpolation
     parameters and the derived parameters are saved, to detect incompatible
     numerical settings on restoration. Explicit YAML paths are supported.
+    ``smooth_floor_width > 0`` selects a non-official CPU smooth variant of
+    the NLDF lower exponent floor; zero keeps the official evaluation.
     """
 
     type = 'MGGA'
 
     def __init__(self, model='CIDER26XCSURFSCI', *, xmix=1.0,
                  xkernel=None, ckernel=None, Nalpha=None, lambd=1.8,
-                 qmax=300.0, pasdw_ovlp_fit=True, pasdw_store_funcs=False):
+                 qmax=300.0, pasdw_ovlp_fit=True, pasdw_store_funcs=False,
+                 smooth_floor_width=0.0):
         super().__init__('CIDER26XCSURFSCI')
+        from ciderpress.dft.exponent_floor import check_floor_cpu, validate_floor_width
+        smooth_floor_width = validate_floor_width(smooth_floor_width)
+        check_floor_cpu(smooth_floor_width)
         builtin = get_builtin_model_name(model)
         self.model = str(model)
         path = (files('ciderpress.data.functionals').joinpath(builtin + '.yaml')
@@ -113,6 +119,8 @@ class CiderXC(XC):
                             Nalpha=Nalpha, lambd=lambd, qmax=qmax,
                             pasdw_ovlp_fit=pasdw_ovlp_fit,
                             pasdw_store_funcs=pasdw_store_funcs)
+        if smooth_floor_width:
+            self.options['smooth_floor_width'] = smooth_floor_width
         kernel = CiderMGGAHybridKernel(self.mlfunc, xmix, xkernel, ckernel)
         base = _CiderBase(kernel, Nalpha=Nalpha, lambd=lambd, encut=qmax,
                           world=serial_comm)
@@ -124,6 +132,8 @@ class CiderXC(XC):
                          encut_atom_min=8000.0, interpolate_dn1=False,
                          cut_xcgrid=False, stencil=2)
         self._cell = None
+        if smooth_floor_width:
+            self.nldf['smooth_floor_width'] = smooth_floor_width
 
     def todict(self):
         return dict(name=self.name, cider_new_version=1, model=self.model,
@@ -201,7 +211,8 @@ class _Engine(CiderPASDW_MPRoutines, _CiderBase):
                                       opts['xkernel'], opts['ckernel'])
         _CiderBase.__init__(self, kernel, Nalpha=opts['Nalpha'],
                             lambd=opts['lambd'], encut=opts['qmax'],
-                            world=_process_comm())
+                            world=_process_comm(),
+                            smooth_floor_width=opts.get('smooth_floor_width', 0.0))
         self.pasdw_ovlp_fit = opts['pasdw_ovlp_fit']
         self.pasdw_store_funcs = opts['pasdw_store_funcs']
         self.interpolate_dn1 = False
@@ -273,6 +284,9 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         # even if construction subsequently fails. CPUPY is always CPU.
         self._device = (xp.cuda.Device().id
                         if getattr(xp, '__name__', '') == 'cupy' else None)
+        from ciderpress.dft.exponent_floor import check_floor_cpu
+        check_floor_cpu(param.options.get('smooth_floor_width', 0.0),
+                        device=self._device)
         if grid.comm.size != 1:
             raise NotImplementedError('New CIDER does not support domain parallelism')
         old = MGGA(LibXC('PBE'), stencil=2)
@@ -386,6 +400,8 @@ class CiderNewMGGAFunctional(MGGAFunctional):
     def calculate(self, nt_sr, taut_sr=None):
         from ciderpress.gpu import policy
         with policy(self._device):
+            from ciderpress.dft.exponent_floor import check_floor_cpu
+            check_floor_cpu(self.param.options.get('smooth_floor_width', 0.0))
             for array in (nt_sr, taut_sr):
                 device = getattr(getattr(array, 'data', None), 'device', None)
                 if self._device is not None and getattr(device, 'id', None) != self._device:
