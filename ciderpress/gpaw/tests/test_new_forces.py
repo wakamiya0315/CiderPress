@@ -50,6 +50,8 @@ def case(monkeypatch):
         def forces(self, n, tau, D):
             assert not np.shares_memory(n, density.nt_sR.data)
             assert not np.shares_memory(tau, density.taut_sR.data)
+            np.testing.assert_array_equal(n, density.nt_sR.data)
+            np.testing.assert_array_equal(tau, density.taut_sR.data)
             np.testing.assert_array_equal(D[0], packed[0])
             n[:] = 0
             tau[:] = 0
@@ -116,12 +118,13 @@ def test_unsupported_properties_stay_closed(monkeypatch):
 
 
 def test_real_interpolation_and_private_PAW_state():
+    from gpaw.mpi import serial_comm
     from ase import Atoms
     from gpaw import GPAW
     atoms = Atoms('H2',positions=[[1.13,1.27,1.31],[1.87,1.34,1.39]],
                   cell=[4,4,4],pbc=True)
     calc = GPAW(mode={'name':'pw','ecut':100},xc=backend.CiderXC(),
-                legacy_gpaw=False,txt=None,symmetry='off')
+                legacy_gpaw=False,txt=None,symmetry='off',communicator=serial_comm)
     calc.create_new_calculation(atoms)
     pc, d = calc.dft.pot_calc, calc.dft.density
     # A fixed positive tau fixture, without claiming an orbital fixed point.
@@ -216,3 +219,59 @@ def test_kpoint_force_assembly(tmp_path):
     force = dft._calculate_forces()
     assert world.sum_scalar(len(calls)) == 1
     np.testing.assert_allclose(force,ref_force,atol=1e-9,rtol=1e-8)
+
+
+def test_tau_input_uses_retained_state_not_output(monkeypatch):
+    f, d, interpolate, calls = case(monkeypatch)
+    # Deliberately different output and history; neither is an XC input.
+    d.tau_state = NS(tau_in=NS(data=d.taut_sR.data.copy()-.1),
+                     output=NS(taut_sR=NS(data=np.full_like(d.taut_sR.data, 99.))),
+                     history=object())
+    d.tauct_R = NS(data=np.full((2, 2, 2), .1))
+    reference = f.force_contribution(d, interpolate)
+    d.tau_state.history = object()
+    d.tau_state.output.taut_sR.data[:] = -99.
+    np.testing.assert_array_equal(reference, f.force_contribution(d, interpolate))
+    d.tau_state = None
+    np.testing.assert_array_equal(reference, f.force_contribution(d, interpolate))
+    assert calls == ['n', 'tau']*3
+
+
+def test_unconverged_cider_tau_force_rejected(tmp_path):
+    from ase import Atoms
+    from gpaw import GPAW, KohnShamConvergenceError
+    from gpaw.mpi import serial_comm
+    atoms = Atoms('H2', positions=[[1.13, 1.27, 1.31], [1.87, 1.34, 1.39]],
+                  cell=[4, 4, 4], pbc=True)
+    seed = GPAW(mode={'name': 'pw', 'ecut': 100}, xc='PBE',
+                legacy_gpaw=False, symmetry='off', txt=None,
+                communicator=serial_comm,
+                convergence={'energy': 1e-8, 'density': 1e-8, 'eigenstates': 1e-10})
+    seed.get_potential_energy(atoms)
+    calc = seed.new(xc=backend.CiderXC(),
+                mixer={'name': 'pulay', 'beta': .03,
+                       'tau': {'method': 'joint', 'beta': .03, 'weight': 10}},
+                convergence={'energy': 1e-8, 'density': 1e-8,
+                             'state_residuals': 1e-8, 'eigenstates': 1e-18},
+                eigensolver={'name': 'ppcg', 'niter': 8, 'min_niter': 2},
+                maxiter=2, txt=str(tmp_path/'cider.log'))
+    calc.create_new_calculation(atoms)
+    source, target = seed.dft, calc.dft
+    target.density.nt_sR.data[:] = source.density.nt_sR.data
+    target.density.D_asii.data[:] = source.density.D_asii.data
+    target.ibzwfs = source.ibzwfs
+    target.density.update_ked(target.ibzwfs)
+    target.potential, target.energies, _ = target.pot_calc.calculate(
+        target.density, target.ibzwfs)
+    with pytest.raises(KohnShamConvergenceError):
+        calc.get_potential_energy(atoms)
+    dft = calc.dft
+    d, p = dft.density, dft.potential
+    arrays = [d.nt_sR.data, d.taut_sR.data, d.D_asii.data,
+              p.vt_sR.data, p.dH_asii.data, p.dedtaut_sR.data]
+    before = [a.copy() for a in arrays]
+    with pytest.raises(RuntimeError, match='fresh tau state'):
+        dft._calculate_forces()
+    assert not hasattr(dft.pot_calc.xc, '_force_engine')
+    for a, b in zip(arrays, before):
+        np.testing.assert_array_equal(a, b)
