@@ -20,20 +20,25 @@ __device__ double saturate_exponent(double a, double cut, double &derivative) {
 extern "C" __global__ void arguments(
     const double* rho, double* out, int* large, long long ng, long long mgga,
     double rhocut, double b, double c, double grad, double cut, long long spin_scale,
-    long long smooth, long long etb, double ratio, double inva, double scale, long long sizem1) {
+    long long smooth, long long etb, double ratio, double inva, double scale, long long sizem1,
+    long long tuple_input) {
     long long g = (long long)blockDim.x*blockIdx.x + threadIdx.x;
     if (g >= ng) return;
     double raw = rho[g];
     bool low = raw < rhocut;
     double n = (double)spin_scale*(low ? rhocut : raw);
-    double sigma = rho[ng+g]*rho[ng+g] + rho[2*ng+g]*rho[2*ng+g];
-    sigma += rho[3*ng+g]*rho[3*ng+g];
+    double sigma;
+    if (tuple_input) sigma = rho[ng+g];
+    else {
+        sigma = rho[ng+g]*rho[ng+g] + rho[2*ng+g]*rho[2*ng+g];
+        sigma += rho[3*ng+g]*rho[3*ng+g];
+    }
     if (spin_scale == 2) sigma *= 4;
     if (low) sigma = 0;
     double a = b*pow(n, 2.0/3.0), dn = 2*b/(3*pow(n, 1.0/3.0));
     double ds = 0, dt = 0;
     if (mgga) {
-        double tau = low ? 0 : (double)spin_scale*rho[4*ng+g];
+        double tau = low ? 0 : (double)spin_scale*rho[(tuple_input ? 2 : 4)*ng+g];
         a += c*tau/n;
         dn -= (c*tau/n)/n;
         dt = c/n;
@@ -97,7 +102,7 @@ def _kernel(name='arguments'):
     return cupy().RawKernel(_SOURCE, name, options=('--fmad=false',))
 
 
-def arguments(plan, rho, i):
+def arguments(plan, rho, i, *, _tuple_input=False):
     """Device argument and all density/sigma/tau derivatives, in FP64."""
     from ciderpress.dft.settings import CFC
 
@@ -131,10 +136,28 @@ def arguments(plan, rho, i):
             rho, out, large, np.int64(ng), np.int64(mgga),
             *(np.float64(v) for v in (plan.rhocut, b, c, g, np.max(plan.alphas))),
             np.int64(spin_scale), np.int64(plan._use_smooth_expnt_cutoff), np.int64(plan.alpha_formula == 'etb'),
-            *(np.float64(v) for v in (ratio, inva, scale)), np.int64(plan._spline_size-1)))
+            *(np.float64(v) for v in (ratio, inva, scale)), np.int64(plan._spline_size-1),
+            np.int64(_tuple_input)))
     if plan._raise_large_expnt_error and bool(cp.any(large)):
         raise RuntimeError('NLDF exponent is too large! Please increase nalpha/alpha_max.')
     return out[0], tuple(out[j] for j in range(1, len(out)))
+
+
+def numpy_arguments(plan, rho_tuple, i=-1):
+    """Spline arguments from existing n/sigma/tau, with NumPy outputs.
+
+    Keep eval_feat_exp's below-cutoff writes to caller work arrays. Sigma
+    is consumed directly, with no reconstructed gradient or square root.
+    """
+    cp = cupy()
+    shape = rho_tuple[0].shape
+    low = rho_tuple[0] < plan.rhocut
+    for x in rho_tuple[1:]:
+        x[low] = 0
+    rho = np.stack(rho_tuple).reshape(len(rho_tuple), -1)
+    a, da = arguments(plan, rho, i, _tuple_input=True)
+    host = cp.asnumpy(cp.stack((a, *da))).reshape(1 + len(da), *shape)
+    return host[0], tuple(host[j] for j in range(1, len(host)))
 
 
 def theta_potential(plan, grid, rho, arg, fun, da, df, out):

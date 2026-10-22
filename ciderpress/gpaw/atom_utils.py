@@ -278,6 +278,11 @@ class FastAtomPASDWSlice:
         if (self.store_funcs) and (self._funcs_gi is not None) and (pfunc):
             return self._funcs_gi
 
+        from ciderpress.gpu import use_gpu
+        if use_gpu('pasdw'):
+            from ciderpress.gpu.pasdw_slice import functions
+            return functions(self, pfunc)
+
         if pfunc:
             funcs_xtp = self.psetup.pfuncs_ntp
             xlist_i = self.psetup.nlist_i

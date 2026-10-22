@@ -636,6 +636,14 @@ class CiderNewMGGAFunctional(MGGAFunctional):
 
 
 def _force_input_digest(n, tau):
+    from ciderpress.gpu import is_enabled
+    if is_enabled():
+        # The host boundary already owns the complete FP64 fields. Keep
+        # immutable byte snapshots instead of hashing them every GPU step.
+        # Equality checks every bit (including signed zero/NaN payloads),
+        # detects in-place edits, and never aliases a caller's mutable array.
+        # The property hooks use the same evaluation policy and comparison.
+        return tuple(np.ascontiguousarray(a).tobytes() for a in (n, tau))
     return tuple(hashlib.sha256(np.ascontiguousarray(a).view(np.uint8)).digest()
                  for a in (n, tau))
 
