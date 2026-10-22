@@ -19,6 +19,7 @@
 #
 
 import ctypes
+from functools import lru_cache
 
 import numpy as np
 from gpaw.xc.gga import GGA
@@ -320,6 +321,8 @@ class CiderPASDW_MPRoutines:
         self.timer.stop()
 
     def interpolate_rbuf_onto_atoms_stress(self, s, pot=False):
+        from ciderpress.gpu import use_gpu
+        device_strain = use_gpu('pasdw')
         self.timer.start("GRID TO PAW GRAD")
         if self.atom_slices_s is None:
             self._setup_atom_slices()
@@ -342,13 +345,17 @@ class CiderPASDW_MPRoutines:
         for a in range(len(self.setups)):
             atom_slice: FastAtomPASDWSlice = atom_slices[a]
             if atom_slice.rad_g.size > 0:
-                funcs_vvig = atom_slice.get_stress_funcs()
-                funcs_gq = np.empty((funcs_vvig.shape[-1], self._plan.nalpha))
+                funcs_vvig = (None if device_strain else
+                              atom_slice.get_stress_funcs())
+                funcs_gq = np.empty((atom_slice.rad_g.size, self._plan.nalpha))
                 self.fft_obj.set_grid2paw(
                     funcs_gq,
                     atom_slice.indset,
                 )
-                coefs_vviq = np.dot(funcs_vvig, funcs_gq)
+                if device_strain:
+                    coefs_vviq = _pasdw_stress_project(atom_slice, funcs_gq)
+                else:
+                    coefs_vviq = np.dot(funcs_vvig, funcs_gq)
                 coefs_vviq[:] *= atom_slice.dv
             else:
                 coefs_vviq = np.zeros((3, 3) + shapes[a])
@@ -369,9 +376,12 @@ class CiderPASDW_MPRoutines:
                             self._save_v_avsiq[a][u, v, s] = coefs_vviq[u, v]
                 if self.pasdw_ovlp_fit:
                     sl = global_slices[a]
-                    X_vvii = sl.get_ovlp_deriv(
-                        sl.get_funcs(), sl.get_grads(), stress=True
-                    )
+                    if device_strain:
+                        X_vvii = _pasdw_stress_overlap(sl, sl.get_funcs(), sl.get_grads())
+                    else:
+                        X_vvii = sl.get_ovlp_deriv(
+                            sl.get_funcs(), sl.get_grads(), stress=True
+                        )
                     coefs_iq = np.linalg.solve(sl.sinv_pf.T, self.c_asiq[a][s])
                     self._save_v_avsiq[a][:, :, s] += np.einsum(
                         "uvij,iq->uvjq", X_vvii, coefs_iq
@@ -725,6 +735,81 @@ class CiderMGGAPASDW(CiderPASDW_MPRoutines, CiderMGGA):
 
         self.gd.comm.broadcast(stress_vv, 0)
         return stress_vv
+
+
+@lru_cache(None)
+def _pasdw_strain_kernel(name):
+    # Stress-only kernels; the policy is checked by the caller. Compile on the
+    # active evaluation device, retaining CuPy's per-device module cache.
+    from ciderpress.gpu import cupy
+    return cupy().RawKernel(r'''
+    extern "C" __global__ void project(
+        const double* dr, const double* grad, const double* field, double* out,
+        long long ng, int ni, int nq) {
+        long long t = (long long)blockDim.x*blockIdx.x + threadIdx.x;
+        if (t >= (long long)9*ni*nq) return;
+        int q = t%nq, i = (t/nq)%ni, v = (t/nq/ni)%3, u = t/nq/ni/3;
+        double value = 0.0;
+        for (long long g = 0; g < ng; g++)
+            value += (dr[u*ng+g]*grad[((long long)v*ni+i)*ng+g])*field[g*nq+q];
+        out[t] = value;
+    }
+    extern "C" __global__ void overlap(
+        const double* dr, const double* p, const double* dp,
+        const double* f, const double* df, double* out,
+        long long ng, int np, int nf) {
+        long long t = (long long)blockDim.x*blockIdx.x + threadIdx.x;
+        if (t >= (long long)9*np*nf) return;
+        int j = t%nf, i = (t/nf)%np, v = (t/nf/np)%3, u = t/nf/np/3;
+        double first = 0.0, second = 0.0;
+        for (long long g = 0; g < ng; g++) {
+            first += (dr[u*ng+g]*p[(long long)i*ng+g])*df[((long long)v*nf+j)*ng+g];
+            second += (dr[u*ng+g]*dp[((long long)v*np+i)*ng+g])*f[(long long)j*ng+g];
+        }
+        out[t] = first + second;
+    }
+    ''', name, options=('--fmad=false',))
+
+
+def _pasdw_stress_project(sl, field):
+    """Ordered grid contraction, without a 9 x function x grid tensor."""
+    from ciderpress.gpu import cupy
+    cp = cupy()
+    grad = np.ascontiguousarray(sl.get_grads())
+    dr = np.ascontiguousarray(sl.rad_g*sl.rhat_gv.T)
+    out = cp.empty((3, 3, grad.shape[1], field.shape[1]), dtype=cp.float64)
+    _pasdw_strain_kernel('project')(((out.size+127)//128,), (128,),
+        (cp.asarray(dr), cp.asarray(grad), cp.asarray(field), out,
+         np.int64(sl.rad_g.size), np.int32(grad.shape[1]), np.int32(field.shape[1])))
+    return out.get()
+
+
+def _pasdw_stress_dovlp(dr, p, dp, f, df):
+    """Raw overlap strain contraction; CPU fit/solve arithmetic stays outside."""
+    from ciderpress.gpu import cupy
+    cp = cupy()
+    arrays = [cp.asarray(np.ascontiguousarray(a)) for a in (dr, p, dp, f, df)]
+    out = cp.empty((3, 3, len(p), len(f)), dtype=cp.float64)
+    _pasdw_strain_kernel('overlap')(((out.size+127)//128,), (128,),
+        (*arrays, out, np.int64(p.shape[1]), np.int32(len(p)), np.int32(len(f))))
+    return out.get()
+
+
+def _pasdw_stress_overlap(sl, p, dp):
+    """Device grid contractions and the original CPU overlap derivative solves."""
+    f, df = sl.get_funcs(False), sl.get_grads(False)
+    # Retain the exact CPU overlap in the ill-conditioned fit/solve.
+    ovlp = np.einsum('pg,fg->pf', p, f)*sl.dv
+    dr = sl.rad_g*sl.rhat_gv.T
+    dovlp = _pasdw_stress_dovlp(dr, p, dp, f, df)*sl.dv
+    for v in range(3):
+        dovlp[v, v] += ovlp
+    B = -1*np.einsum('uvpf,pq->uvfq', dovlp, sl.sinv_pf)
+    result = np.empty((3, 3, len(p), len(p)))
+    for i in range(3):
+        for j in range(3):
+            result[i, j] = np.linalg.solve(ovlp.T, B[i, j])
+    return result
 
 
 def cider_smooth_stress(gd, e, rho, dedrho, tensor):
