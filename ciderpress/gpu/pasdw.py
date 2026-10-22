@@ -279,6 +279,50 @@ def radial(owner, atco, r, nlm, x, to_orb):
     return _contract(tables, x, ns, nr, nlm, nu, nq, to_orb)
 
 
+def fixed_radial(mapping, x, to_orb):
+    """The shared fixed K W / K.T pair, accumulated in device float64.
+
+    K is constructed by RadialTransform on the host. Its immutable matrices
+    own the cache, so setup reinitialization also discards device tables.
+    Host callers retain the NumPy interface; pipeline callers stay on device.
+    """
+    cp = cupy()
+    if np.iscomplexobj(x) or x.ndim != (4 if to_orb else 3):
+        raise ValueError('Expected real radial or orbital feature values')
+    if x.dtype != np.float64:
+        raise ValueError('PASDW radial values must be float64')
+    if to_orb:
+        if x.shape[1:3] != (mapping.nk, mapping.nlm):
+            raise ValueError('Radial grid shape changed')
+    elif x.shape[1] != mapping.loc[-1]:
+        raise ValueError('Orbital coefficient count changed')
+    matrices, weights = _cached(
+        mapping, 'fixed_radial', (),
+        lambda cp: (tuple(cp.asarray(np.asarray(a, dtype=np.float64))
+                          for a in mapping.matrices), cp.asarray(mapping.weights)))
+    device = isinstance(x, cp.ndarray)
+    values = cp.asarray(x)
+    ns, nq, nk = len(x), x.shape[-1], mapping.nk
+    shape = (ns, mapping.loc[-1], nq) if to_orb else (ns, nk, mapping.nlm, nq)
+    out = cp.zeros(shape, dtype=cp.float64)
+    if nq:
+        for l, matrix in enumerate(matrices):
+            if not len(matrix):
+                continue
+            nm = 2*l+1
+            a, b = mapping.loc[l:l+2]
+            if to_orb:
+                block = values[:, :, l*l:(l+1)**2] * weights[None, :, None, None]
+                projected = matrix @ block.transpose(1, 0, 2, 3).reshape(nk, -1)
+                out[:, a:b] = projected.reshape(len(matrix), ns, nm, nq).transpose(
+                    1, 0, 2, 3).reshape(ns, len(matrix)*nm, nq)
+            else:
+                block = values[:, a:b].reshape(ns, len(matrix), nm, nq)
+                projected = matrix.T @ block.transpose(1, 0, 2, 3).reshape(len(matrix), -1)
+                out[:, :, l*l:(l+1)**2] = projected.reshape(nk, ns, nm, nq).transpose(1, 0, 2, 3)
+    return out if device else cp.asnumpy(out)
+
+
 def numeric_basis(owner, p_uq, p_rlmq, fwd):
     """The already fitted PAW radial projectors; no device fitting/solve."""
     signature = _signature(owner.funcs_ig, owner.iloc_l) + (owner.nlm,)
