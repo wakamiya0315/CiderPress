@@ -70,6 +70,26 @@ USE_GAUSSIAN_SBT = True
 USE_GAUSSIAN_SBT = USE_GAUSSIAN_SBT or USE_GAUSSIAN_PAW_CONV
 
 
+def _terminate_spline_at_cutoff(coefficients, coordinate):
+    """End a compact radial spline at its actual (possibly off-knot) cutoff.
+
+    Retain the last interval's left value and slope, and impose zero value
+    and slope at the sphere boundary.  Slices exclude points beyond it.
+    """
+    nearest = round(coordinate)
+    if abs(coordinate - nearest) <= 32 * np.finfo(float).eps * max(1, abs(coordinate)):
+        coordinate = nearest
+    if not 0 < coordinate <= coefficients.shape[-2] - 1:
+        raise ValueError("Radial cutoff must lie within the interpolation grid")
+    index = int(np.ceil(coordinate)) - 1
+    width = coordinate - index
+    ending = coefficients[..., index, :]
+    value, slope = ending[..., 0].copy(), ending[..., 1].copy()
+    ending[..., 2] = -(3 * value + 2 * width * slope) / width**2
+    ending[..., 3] = (2 * value + width * slope) / width**3
+    coefficients[..., index + 1 :, :] = 0.0
+
+
 def get_ag_indices(fft_obj, gd, shape, spos_c, rmax, buffer=0, get_global_disps=False):
     center = np.round(spos_c * shape).astype(int)
     disp = np.empty(3, dtype=int)
@@ -1754,6 +1774,10 @@ class PAugSetup(PASDWData):
             )
         # TODO should work but dangerous, make cleaner way to set rcut_func
         self.rcut_func = self.rcut_feat
+        # A sampled filter does not terminate at an off-knot sphere boundary.
+        # Use the same Hermite termination for host and device table consumers.
+        spacing = self.interp_rgd.r_g[1] - self.interp_rgd.r_g[0]
+        _terminate_spline_at_cutoff(self.pfuncs_ntp, self.rcut_func / spacing)
 
     def get_filt(self, r_g):
         filt = 0.5 + 0.5 * np.cos(np.pi * r_g / self.rcut_feat)

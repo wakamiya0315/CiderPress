@@ -226,6 +226,9 @@ class _Engine(CiderPASDW_MPRoutines, _CiderBase):
         self.initialize_paw_kernel(self.cider_kernel, nalpha, encut)
 
     def _get_cider_inputs(self, n_sg, taut_sg):
+        # A content token, rather than array identity, detects in-place changes
+        # before a property replay.  This does not change the numerical path.
+        self._force_input_digest = _force_input_digest(n_sg, taut_sg)
         from ciderpress.gpu import use_gpu
         if use_gpu('fine_grid'):
             from ciderpress.gpu.fine_grid import get_rho
@@ -444,13 +447,126 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         return float(engine.E_a_tmp[a])
 
     def validate_force_calculation(self):
-        raise NotImplementedError('New CIDER forces are not implemented')
+        if not self._paw_ready or self._density is None:
+            raise RuntimeError('New CIDER forces require a fresh grid/PAW evaluation')
+        density = self._density
+        if density.nt_sR.dims != (1,) or density.taut_sR is None:
+            raise NotImplementedError('New CIDER forces require one spin and tau')
+        if density.nt_sR.desc.comm.size != 1:
+            raise NotImplementedError('New CIDER forces require serial domains')
+        if not np.array_equal(self.engine.spos_ac, self._relpos):
+            raise RuntimeError('New CIDER force geometry is stale')
 
     def add_forces(self, *args, **kwargs):
+        raise NotImplementedError('Use the New CIDER explicit force_contribution hook')
+
+    def force_contribution(self, density, interpolate):
+        """Root-owned explicit PASDW force in Ha/Bohr, with private scratch.
+
+        New owns projector/dH, core n/tau, Hartree and vbar terms.  In
+        particular this never calls Classic MGGA.add_forces or _get_taut.
+        No communicator other than the engine's private SELF is entered.
+        """
+        from ciderpress.gpu import policy
         self.validate_force_calculation()
+        if density is not self._density:
+            raise RuntimeError('New CIDER force density is stale')
+        with policy(self._device):
+            # Use exactly the SCF interpolation and density packing.  Copies
+            # protect the caller even if a numerical routine raises midway.
+            fields = [interpolate(density.nt_sR), interpolate(density.taut_sR)]
+            for field in fields:
+                device = getattr(getattr(field, 'data', None), 'device', None)
+                device_id = getattr(device, 'id', None)
+                if self._device is not None and device_id is not None and device_id != self._device:
+                    raise ValueError('New CIDER input differs from its recorded CUDA device')
+            n, tau = [field.to_xp(np) for field in fields]
+            for array in (n, tau):
+                if array.dims != (1,) or any(
+                    not np.array_equal(getattr(array.desc, key), getattr(self.grid, key))
+                    for key in ('cell_cv', 'size_c', 'pbc_c')
+                ):
+                    raise NotImplementedError('New CIDER force grid/spin changed')
+                if not np.isfinite(array.data).all():
+                    raise ValueError('New CIDER forces require finite inputs')
+            if _force_input_digest(n.data, tau.data) != self.engine._force_input_digest:
+                raise RuntimeError('New CIDER force n/tau differs from the current XC state')
+            matrices = density.D_asii.to_xp(np)
+            if (matrices.layout.atomdist.comm.size != 1 or
+                    np.any(matrices.layout.atomdist.rank_a != 0) or
+                    set(matrices.keys()) != set(range(len(self.setups)))):
+                raise NotImplementedError('New CIDER force atom distribution changed')
+            packed = self.engine.setups.empty_atomic_matrix(1, self.engine.atom_partition)
+            for a, D_sii in matrices.items():
+                packed[a][:] = [pack_density(D_ii.real) for D_ii in D_sii]
+                if not np.isfinite(packed[a]).all():
+                    raise ValueError('New CIDER forces require finite D')
+                if not np.array_equal(packed[a], self.engine.dens.D_asp[a]):
+                    raise RuntimeError('New CIDER force D differs from the current XC state')
+            if not hasattr(self, '_force_engine'):
+                self._force_engine = _ForceEngine(self.param, self.grid, self.grad_v,
+                                                   self.setups, self._relpos)
+            engine = self._force_engine
+            try:
+                return engine.forces(n.data.copy(), tau.data.copy(), packed)
+            except BaseException:
+                # Never reuse a partially evaluated private engine.
+                del self._force_engine
+                raise
 
     def stress_contribution(self, *args, **kwargs):
         self.validate_stress_calculation()
 
     def validate_stress_calculation(self):
         raise NotImplementedError('New CIDER stress is not implemented')
+
+
+def _force_input_digest(n, tau):
+    return tuple(hashlib.sha256(np.ascontiguousarray(a).view(np.uint8)).digest()
+                 for a in (n, tau))
+
+
+class _ForceEngine(_Engine):
+    """Property-only mutable PAW/FFT state; never aliases SCF PAW caches."""
+
+    def __init__(self, param, grid, grad_v, setups, relpos):
+        super().__init__(param, grid, grad_v)
+        self.setups = copy(setups)
+        copies = {}
+        for a, setup in enumerate(setups):
+            if id(setup) not in copies:
+                clone = copy(setup)
+                clone.cider_contribs = None
+                copies[id(setup)] = clone
+            self.setups[a] = copies[id(setup)]
+        self.spos_ac = np.array(relpos, copy=True)
+        self.atom_partition = AtomPartition(self.world, np.zeros(len(setups), int))
+        self.dens = SimpleNamespace(setups=self.setups)
+
+    def forces(self, n, tau, packed):
+        self.dens.nt_sg = n
+        self.dens.D_asp = packed
+        self.force_terms = {}
+        e, rho, dedrho = self._get_cider_inputs(n, tau)
+        forces = self.calc_cider(e, rho, dedrho, grad_mode=1)
+        result = np.zeros((len(self.setups), 3))
+        for a, force in forces.items():
+            result[a] = force
+        if not np.isfinite(result).all():
+            raise ValueError('Nonfinite New CIDER explicit force')
+        return result
+
+    def _calculate_paw_energy_and_potential(self, grad_mode=0):
+        result = super()._calculate_paw_energy_and_potential(grad_mode)
+        if grad_mode == 1:
+            self.force_terms['Q'] = np.array([
+                np.einsum('vsiq,siq->v', self._save_v_avsiq[a], self.c_asiq[a])
+                for a in range(len(self.setups))])
+        return result
+
+    def get_fft_work(self, s, pot=False, grad_mode=0):
+        super().get_fft_work(s, pot=pot, grad_mode=grad_mode)
+        if pot and grad_mode == 1 and s == self.nspin - 1:
+            self.force_terms['B'] = np.array([
+                np.einsum('vsiq,siq->v', self._save_v_avsiq[a], self._save_c_asiq[a])
+                for a in range(len(self.setups))])
