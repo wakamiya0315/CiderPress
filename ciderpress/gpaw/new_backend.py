@@ -477,8 +477,10 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         if not self._paw_ready or self._density is None:
             raise RuntimeError('New CIDER forces require a fresh grid/PAW evaluation')
         density = self._density
-        if density.nt_sR.dims != (1,) or density.taut_sR is None:
-            raise NotImplementedError('New CIDER forces require one spin and tau')
+        if density.nt_sR.dims not in ((1,), (2,)) or density.taut_sR is None:
+            raise NotImplementedError('New CIDER forces require one or two collinear spins and tau')
+        if density.taut_sR.dims != density.nt_sR.dims:
+            raise ValueError('New CIDER force n/tau spin shapes differ')
         if density.nt_sR.desc.comm.size != 1:
             raise NotImplementedError('New CIDER forces require serial domains')
         if not np.array_equal(self.engine.spos_ac, self._relpos):
@@ -513,7 +515,7 @@ class CiderNewMGGAFunctional(MGGAFunctional):
                     raise ValueError('New CIDER input differs from its recorded CUDA device')
             n, tau = [field.to_xp(np) for field in fields]
             for array in (n, tau):
-                if array.dims != (1,) or any(
+                if array.dims != density.nt_sR.dims or any(
                     not np.array_equal(getattr(array.desc, key), getattr(self.grid, key))
                     for key in ('cell_cv', 'size_c', 'pbc_c')
                 ):
@@ -527,8 +529,11 @@ class CiderNewMGGAFunctional(MGGAFunctional):
                     np.any(matrices.layout.atomdist.rank_a != 0) or
                     set(matrices.keys()) != set(range(len(self.setups)))):
                 raise NotImplementedError('New CIDER force atom distribution changed')
-            packed = self.engine.setups.empty_atomic_matrix(1, self.engine.atom_partition)
+            nspins = density.nt_sR.dims[0]
+            packed = self.engine.setups.empty_atomic_matrix(nspins, self.engine.atom_partition)
             for a, D_sii in matrices.items():
+                if D_sii.ndim != 3 or D_sii.shape[0] != nspins:
+                    raise ValueError('New CIDER force n/tau/D spin shapes differ')
                 packed[a][:] = [pack_density(D_ii.real) for D_ii in D_sii]
                 if not np.isfinite(packed[a]).all():
                     raise ValueError('New CIDER forces require finite D')
@@ -570,6 +575,10 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         return result
 
     def validate_stress_calculation(self):
+        # The force validator also accepts collinear spins. Stress retains
+        # its independent one-spin certificate.
+        if self._density is not None and self._density.nt_sR.dims != (1,):
+            raise NotImplementedError('New CIDER stress requires one spin')
         self.validate_force_calculation()
         if not np.all(self.grid.pbc_c):
             raise NotImplementedError('New CIDER stress requires periodic bulk')
