@@ -737,6 +737,14 @@ class _StressEngine(_ForceEngine):
         # Correct the inherited odd-nz multiplicity only in this private
         # property engine; native SCF and force paths remain unchanged.
         fft = self.fft_obj
+        from ciderpress.gpu import use_gpu
+        if use_gpu('nldf_fft') and fft.comm.size == 1 and fft.nalpha == fft.nbeta:
+            previous = getattr(fft, '_stress_full_rfft', False)
+            fft._stress_full_rfft = True
+            try:
+                return super().call_bwd(*args, **kwargs)
+            finally:
+                fft._stress_full_rfft = previous
         if fft.shape[2] % 2 == 0:
             return super().call_bwd(*args, **kwargs)
         from ciderpress.gpaw.cider_paw import odd_fft_stress_correction

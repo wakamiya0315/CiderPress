@@ -234,6 +234,9 @@ class LibCiderPW:
             self._device_work.sync()
 
     def fftv2(self, arr_gq):
+        work = self._gpu_work()
+        if work is not None:
+            return work.fftv2(arr_gq)
         self._sync_work_to_host()
         pwutil.ciderpw_g2k_v2(
             self._ptr,
@@ -282,6 +285,10 @@ class LibCiderPW:
         pwutil.ciderpw_compute_potential(self._ptr)
 
     def compute_backward_convolution_with_stress(self, theta_gq):
+        work = self._gpu_work()
+        if work is not None:
+            return work.convolve_with_stress(
+                theta_gq, full_rfft=getattr(self, '_stress_full_rfft', False))
         self._sync_work_to_host()
         stress_vv = np.zeros((3, 3))
         pwutil.ciderpw_convolution_potential_and_stress(
