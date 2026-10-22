@@ -9,7 +9,8 @@ from scipy.linalg.lapack import dpotrs
 
 from ciderpress.gpu import cupy, use_gpu
 from ciderpress.gpu.pasdw import (_cached, _signature, _table_revision, radial, solve, r2k,
-                                  reciprocal_convolution, numeric_basis, coefficients)
+                                  reciprocal_convolution, numeric_basis, coefficients,
+                                  fixed_radial)
 
 
 def _slices(p, l, m):
@@ -134,16 +135,11 @@ def constant(owner, name, x):
 
 
 def k2orb(p, x):
-    from ciderpress.gpaw.fit_paw_gauss_pot import get_dvk
-
-    x = x * constant(p, 'dvk', get_dvk(p.sbt_rgd))[:, None, None]
-    a = radial(p, p.pcol.atco_recip, p.sbt_rgd.k_g, x.shape[-2], x, True)
-    return solve(p.pcol.atco, a)
+    return fixed_radial(p._get_radial_transform(x.shape[2]), x, True)
 
 
 def orb2k(p, x):
-    return radial(p, p.pcol.atco_recip, p.sbt_rgd.k_g, p._grid_nlm,
-                  solve(p.pcol.atco, x), False)
+    return fixed_radial(p._get_radial_transform(p._grid_nlm), x, False)
 
 
 def basis(p, x, fwd):
