@@ -8,12 +8,12 @@ from gpaw.utilities import pack_density
 import ciderpress.gpaw.new_backend as backend
 
 
-def case(monkeypatch):
+def case(monkeypatch, nspins=1):
     grid = NS(cell_cv=np.eye(3), size_c=np.array([2]*3), pbc_c=np.ones(3, bool),
               comm=NS(size=1))
 
     class Field:
-        dims = (1,)
+        dims = (nspins,)
         desc = grid
 
         def __init__(self, data):
@@ -29,14 +29,18 @@ def case(monkeypatch):
         def to_xp(self, xp):
             return self
 
-    matrices = Matrices({0: np.array([[[1., .2], [.2, .5]]])})
-    density = NS(nt_sR=Field(np.ones((1, 2, 2, 2))),
-                 taut_sR=Field(np.full((1, 2, 2, 2), .3)), D_asii=matrices)
-    packed = {0: np.array([pack_density(matrices[0][0])])}
+    matrices = Matrices({0: np.array([[[1., .2], [.2, .5]]]) *
+                        np.arange(1, nspins + 1)[:, None, None]})
+    density = NS(nt_sR=Field(np.ones((nspins, 2, 2, 2))),
+                 taut_sR=Field(np.full((nspins, 2, 2, 2), .3)), D_asii=matrices)
+    packed = {0: np.array([pack_density(D) for D in matrices[0]])}
+    def allocate(spins, partition):
+        assert spins == nspins
+        return {0: np.empty_like(packed[0])}
     engine = NS(spos_ac=np.zeros((1, 3)), atom_partition=object(),
         dens=NS(D_asp=packed), _force_input_digest=backend._force_input_digest(
             density.nt_sR.data, density.taut_sR.data),
-        setups=NS(empty_atomic_matrix=lambda *a: {0: np.empty_like(packed[0])}))
+        setups=NS(empty_atomic_matrix=allocate))
     f = object.__new__(backend.CiderNewMGGAFunctional)
     f.engine, f.grid, f.setups = engine, grid, [object()]
     f.param, f.grad_v, f._device = object(), [], None
@@ -68,31 +72,36 @@ def case(monkeypatch):
     return f, density, interpolate, calls
 
 
-def test_private_property_inputs_and_repeat(monkeypatch):
-    f, d, interpolate, calls = case(monkeypatch)
+@pytest.mark.parametrize('nspins', [1, 2])
+def test_private_property_inputs_and_repeat(monkeypatch, nspins):
+    f, d, interpolate, calls = case(monkeypatch, nspins)
+    saved_D = d.D_asii[0].copy()
     for _ in range(2):
         np.testing.assert_array_equal(f.force_contribution(d, interpolate), [[1, 1, 1]])
     assert calls == ['n', 'tau']*2
     assert f._paw_ready
     np.testing.assert_array_equal(d.nt_sR.data, 1)
     np.testing.assert_array_equal(d.taut_sR.data, .3)
-    np.testing.assert_array_equal(d.D_asii[0], [[[1, .2], [.2, .5]]])
+    np.testing.assert_array_equal(d.D_asii[0], saved_D)
 
 
 @pytest.mark.parametrize('field', ['nt_sR', 'taut_sR', 'D_asii'])
-def test_stale_content_rejected(monkeypatch, field):
-    f, d, interpolate, _ = case(monkeypatch)
+@pytest.mark.parametrize('nspins', [1, 2])
+def test_stale_content_rejected(monkeypatch, field, nspins):
+    f, d, interpolate, _ = case(monkeypatch, nspins)
     if field == 'D_asii':
-        d.D_asii[0][0, 0, 0] += .01
+        d.D_asii[0][-1, 0, 0] += .01
     else:
-        getattr(d, field).data.flat[0] += .01
+        getattr(d, field).data[-1, 0, 0, 0] += .01
     with pytest.raises(RuntimeError, match='current XC state'):
         f.force_contribution(d, interpolate)
     assert not hasattr(f, '_force_engine')
 
 
-def test_exception_preserves_scf(monkeypatch):
-    f, d, interpolate, calls = case(monkeypatch)
+@pytest.mark.parametrize('nspins', [1, 2])
+def test_exception_preserves_scf(monkeypatch, nspins):
+    f, d, interpolate, calls = case(monkeypatch, nspins)
+    saved_D = f.engine.dens.D_asp[0].copy()
     # Trigger after interpolation and after private arrays have been mutated.
     def fail_interp(a):
         result = interpolate(a)
@@ -105,25 +114,42 @@ def test_exception_preserves_scf(monkeypatch):
     assert f._paw_ready and f._density is d
     np.testing.assert_array_equal(d.nt_sR.data, 1)
     np.testing.assert_array_equal(d.taut_sR.data, .3)
-    np.testing.assert_array_equal(f.engine.dens.D_asp[0], [[1, .4, .5]])
+    np.testing.assert_array_equal(f.engine.dens.D_asp[0], saved_D)
 
 
 def test_unsupported_properties_stay_closed(monkeypatch):
     f, d, interpolate, _ = case(monkeypatch)
     with pytest.raises(NotImplementedError, match='stress'):
         f.stress_contribution()
-    d.nt_sR.dims = (2,)
-    with pytest.raises(NotImplementedError, match='one spin'):
+    d.nt_sR.dims = (4,)
+    with pytest.raises(NotImplementedError, match='collinear spins'):
         f.force_contribution(d, interpolate)
 
 
-def test_real_interpolation_and_private_PAW_state():
+def test_two_spin_stress_and_malformed_force_inputs(monkeypatch):
+    f, d, interpolate, _ = case(monkeypatch, 2)
+    with pytest.raises(NotImplementedError, match='stress requires one spin'):
+        f.validate_stress_calculation()
+    d.taut_sR.dims = (1,)
+    with pytest.raises(ValueError, match='n/tau spin shapes'):
+        f.force_contribution(d, interpolate)
+    d.taut_sR.dims = (2,)
+    d.D_asii[0] = d.D_asii[0][:1]
+    with pytest.raises(ValueError, match='n/tau/D spin shapes'):
+        f.force_contribution(d, interpolate)
+
+
+@pytest.mark.parametrize('nspins', [1, 2])
+def test_real_interpolation_and_private_PAW_state(nspins):
     from gpaw.mpi import serial_comm
     from ase import Atoms
     from gpaw import GPAW
     atoms = Atoms('H2',positions=[[1.13,1.27,1.31],[1.87,1.34,1.39]],
                   cell=[4,4,4],pbc=True)
+    if nspins == 2:
+        atoms.set_initial_magnetic_moments([.7, .3])
     calc = GPAW(mode={'name':'pw','ecut':100},xc=backend.CiderXC(),
+                spinpol=nspins == 2,
                 legacy_gpaw=False,txt=None,symmetry='off',communicator=serial_comm)
     calc.create_new_calculation(atoms)
     pc, d = calc.dft.pot_calc, calc.dft.density
@@ -157,7 +183,8 @@ def test_real_interpolation_and_private_PAW_state():
     assert f.engine is not f._force_engine
 
 
-def test_kpoint_force_assembly(tmp_path):
+@pytest.mark.parametrize('nspins', [1, 2])
+def test_kpoint_force_assembly(tmp_path, nspins):
     """Actual 1/2/4-k-point assembly on identical n/tau/D and orbitals.
 
     This is an arithmetic/ownership test at a PBE-seeded CIDER input, not a
@@ -168,6 +195,8 @@ def test_kpoint_force_assembly(tmp_path):
     from gpaw.mpi import serial_comm, world
     atoms = Atoms('H2',positions=[[1.13,1.27,1.31],[1.87,1.34,1.39]],
                   cell=[4,4,4],pbc=True)
+    if nspins == 2:
+        atoms.set_initial_magnetic_moments([.7, .3])
     # pytest allocates process-local temporary paths; share rank zero's path.
     from gpaw.mpi import broadcast
     checkpoint = broadcast(str(tmp_path/'pbe.gpw') if world.rank == 0 else None,
@@ -175,6 +204,8 @@ def test_kpoint_force_assembly(tmp_path):
     layout = dict(kpt=1,domain=1,band=1,distribute_density=False,gpu=False)
     if world.rank == 0:
         seed = GPAW(mode={'name':'pw','ecut':80},xc='PBE',kpts=(2,2,1),
+            spinpol=nspins == 2,
+            occupations=dict(name='fermi-dirac', width=.1, fixmagmom=nspins == 2),
             nbands=2,legacy_gpaw=False,txt=None,symmetry='off',communicator=serial_comm,
             parallel=layout,convergence=dict(energy=1e-5,density=1e-4,eigenstates=1e-6))
         seed.get_potential_energy(atoms)
@@ -221,8 +252,9 @@ def test_kpoint_force_assembly(tmp_path):
     np.testing.assert_allclose(force,ref_force,atol=1e-9,rtol=1e-8)
 
 
-def test_tau_input_uses_retained_state_not_output(monkeypatch):
-    f, d, interpolate, calls = case(monkeypatch)
+@pytest.mark.parametrize('nspins', [1, 2])
+def test_tau_input_uses_retained_state_not_output(monkeypatch, nspins):
+    f, d, interpolate, calls = case(monkeypatch, nspins)
     # Deliberately different output and history; neither is an XC input.
     d.tau_state = NS(tau_in=NS(data=d.taut_sR.data.copy()-.1),
                      output=NS(taut_sR=NS(data=np.full_like(d.taut_sR.data, 99.))),
@@ -237,16 +269,23 @@ def test_tau_input_uses_retained_state_not_output(monkeypatch):
     assert calls == ['n', 'tau']*3
 
 
-def test_unconverged_cider_tau_force_rejected(tmp_path):
+@pytest.mark.parametrize('nspins', [1, 2])
+def test_unconverged_cider_tau_force_rejected(tmp_path, nspins):
     from ase import Atoms
     from gpaw import GPAW, KohnShamConvergenceError
     from gpaw.mpi import serial_comm
     atoms = Atoms('H2', positions=[[1.13, 1.27, 1.31], [1.87, 1.34, 1.39]],
                   cell=[4, 4, 4], pbc=True)
+    spin = {}
+    if nspins == 2:
+        atoms.set_initial_magnetic_moments([1., 1.])
+        spin = dict(spinpol=True, occupations=dict(name='fermi-dirac', width=.1,
+                                                  fixmagmom=True))
     seed = GPAW(mode={'name': 'pw', 'ecut': 100}, xc='PBE',
                 legacy_gpaw=False, symmetry='off', txt=None,
                 communicator=serial_comm,
-                convergence={'energy': 1e-8, 'density': 1e-8, 'eigenstates': 1e-10})
+                convergence={'energy': 1e-8, 'density': 1e-8, 'eigenstates': 1e-10},
+                **spin)
     seed.get_potential_energy(atoms)
     calc = seed.new(xc=backend.CiderXC(),
                 mixer={'name': 'pulay', 'beta': .03,
