@@ -725,3 +725,63 @@ class CiderMGGAPASDW(CiderPASDW_MPRoutines, CiderMGGA):
 
         self.gd.comm.broadcast(stress_vv, 0)
         return stress_vv
+
+
+def cider_smooth_stress(gd, e, rho, dedrho, tensor):
+    """Extensive smooth CIDER stress from raw five-channel derivatives.
+
+    rho includes pseudo-core n/tau; tensor contains valence orbital T only,
+    packed xx,xy,xz,yy,yz,zz, with trace(T)=2*tau_valence.  Generic New PAW,
+    core, projector and kinetic terms, volume division and MPI sums are owned
+    by the caller.  In particular, no one-center PAW energy enters P here.
+    """
+    pairs = ((0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2))
+    P = gd.integrate(e, global_integral=False)
+    for r, v in zip(rho.reshape((-1,) + e.shape),
+                    dedrho.reshape((-1,) + e.shape)):
+        P -= gd.integrate(r, v, global_integral=False)
+    result = P * np.eye(3)
+    for s in range(len(rho)):
+        for i in range(3):
+            for j in range(3):
+                result[i, j] -= gd.integrate(rho[s, i + 1], dedrho[s, j + 1],
+                                             global_integral=False)
+        for T, (i, j) in zip(tensor[s], pairs):
+            value = gd.integrate(T, dedrho[s, 4], global_integral=False)
+            result[i, j] -= value
+            if i != j:
+                result[j, i] -= value
+    return 0.5 * (result + result.T)
+
+
+def odd_fft_stress_correction(fft, theta, adjoint):
+    """Missing highest-z rFFT multiplicity in the native odd-grid stress.
+
+    The native serial AND MPI stress routines give the last stored z plane
+    weight one for both parities. It is a Nyquist plane only for even nz.
+    This property-only correction leaves convolution/energy arithmetic intact.
+    Inputs are real-space arrays with the alpha channel last, not native
+    transposed reciprocal buffers. SELF ownership is required by New CIDER.
+    """
+    nx, ny, nz = fft.shape
+    if nz % 2 == 0:
+        return np.zeros((3, 3))
+    if fft.comm.size != 1:
+        raise NotImplementedError('Odd-grid XC stress requires serial FFT')
+    x = np.fft.rfftn(theta, axes=(0, 1, 2))[:, :, -1]
+    y = np.fft.rfftn(adjoint, axes=(0, 1, 2))[:, :, -1]
+    ix = np.fft.fftfreq(nx) * nx
+    iy = np.fft.fftfreq(ny) * ny
+    integers = np.stack(np.broadcast_arrays(ix[:, None], iy[None, :],
+                                            np.full((nx, ny), nz // 2)), axis=-1)
+    G = integers @ (2 * np.pi * np.linalg.inv(fft._cell_cv).T)
+    G2 = (G**2).sum(axis=-1)
+    weight = np.zeros((nx, ny))
+    for a in range(fft.nalpha):
+        for b in range(fft.nbeta):
+            exponent = fft.expnts_ab[a, b]
+            dK = (2 * exponent * fft.norms_ab[a, b] *
+                  np.exp(-exponent * G2))
+            weight += (x[..., a] * y[..., b].conj()).real * dK
+    dv = abs(np.linalg.det(fft._cell_cv)) / (nx * ny * nz)
+    return np.einsum('xy,xyi,xyj->ij', weight, G, G) * dv / (nx * ny * nz)
