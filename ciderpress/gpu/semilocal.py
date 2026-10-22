@@ -85,7 +85,7 @@ def evaluate_device(model, x, rho, rhocut):
             f = f.reshape(ns, n)
             df = df.reshape(ns, n, k.N1)
         if rhocut > 0:
-            cond = rho[0] < rhocut if sep else rho[0].sum(0) < rhocut
+            cond = ns * rho[0] < rhocut if sep else rho[0].sum(0) < rhocut
             f[cond] = 0.
             df[cond] = 0.
         m = _baseline(k._mul_basefunc, rho, sep)

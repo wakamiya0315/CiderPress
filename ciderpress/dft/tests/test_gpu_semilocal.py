@@ -86,6 +86,38 @@ def test_unsupported_map_falls_back():
     assert signature(FeatureList([UMap(0, 1.)])) is None
 
 
+@pytest.mark.parametrize('nspin', [1, 2])
+def test_sep_spin_scaled_cutoff(device, monkeypatch, nspin):
+    """Probe both sides and equality at rhocut/nspin, including empty spin."""
+    from ciderpress.gpaw.new_backend import CiderXC
+    model = CiderXC().mlfunc
+    cut = .1
+    boundary = cut/nspin
+    values = np.array([0., 1e-20, np.nextafter(boundary, 0), boundary,
+                       np.nextafter(boundary, np.inf), .075, .2])
+    rho = np.repeat(values[None], nspin, axis=0)
+    if nspin == 2:
+        rho[1] = rho[1, ::-1]
+    sigma = np.full((2*nspin-1, len(values)), 1e-8)
+    if nspin == 2:
+        sigma[1] *= -.3  # physically admissible mixed sigma
+    tau = np.full_like(rho, .4)
+    x = np.ones((nspin, 6, len(values))) * .4
+    x[:, 0] = nspin*rho
+    x[:, 1] = nspin**2*sigma[::2]
+    x[:, 2] = nspin*tau
+    for kernels in ([model.kernels[0]], model.kernels):
+        from copy import copy
+        selected = copy(model)
+        selected.kernels = kernels
+        monkeypatch.setenv('CIDER_GPU_KERNELS', 'none')
+        ref = selected(x, (rho, sigma, tau), rhocut=cut)
+        monkeypatch.setenv('CIDER_GPU_KERNELS', 'rbf,libxc,semilocal')
+        got = selected(x, (rho, sigma, tau), rhocut=cut)
+        for a, b in zip((got[0], got[1], *got[2]), (ref[0], ref[1], *ref[2])):
+            np.testing.assert_allclose(a, b, atol=2e-12, rtol=1e-12)
+
+
 @pytest.mark.parametrize("nspin", [1, 2])
 def test_gpu_directional_derivative(device, monkeypatch, nspin):
     from ciderpress.gpaw.new_backend import CiderXC

@@ -132,7 +132,7 @@ class CiderXC(XC):
 
     def functional(self, *, collinear, atoms=None):
         if not collinear:
-            raise NotImplementedError('New CIDER does not support spin polarization')
+            raise NotImplementedError('New CIDER does not support noncollinear spin')
         if atoms is not None:
             cell = atoms.cell.array.tolist()
             if self._cell is not None and not np.array_equal(cell, self._cell):
@@ -284,6 +284,7 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         self._relpos = None
         self.setups = None
         self._density = None
+        self._nspins = None
         self._paw_ready = False
         # Bounded diagnostics, including no-op boundaries for profile callers.
         self.transfer_timings = []
@@ -347,8 +348,15 @@ class CiderNewMGGAFunctional(MGGAFunctional):
             engine.dens = SimpleNamespace(setups=engine.setups)
 
     def set_density(self, density):
-        if density.nt_sR.dims != (1,):
-            raise NotImplementedError('New CIDER does not support spin polarization')
+        self._paw_ready = False
+        dims = density.nt_sR.dims
+        if dims not in ((1,), (2,)):
+            raise NotImplementedError('New CIDER requires one or two collinear spins')
+        nspins = dims[0]
+        if self._nspins is not None and nspins != self._nspins:
+            raise ValueError('New CIDER cannot change spin count on a live engine')
+        if density.taut_sR is None or density.taut_sR.dims != dims:
+            raise ValueError('New CIDER density n/tau spin shapes differ')
         if density.nt_sR.desc.comm.size != 1:
             raise NotImplementedError('New CIDER does not support domain parallelism')
         engine = self.engine
@@ -361,10 +369,14 @@ class CiderNewMGGAFunctional(MGGAFunctional):
             raise NotImplementedError('New CIDER density atom distribution mismatch')
         if set(matrices.keys()) != set(range(len(engine.setups))):
             raise ValueError('New CIDER requires each atom exactly once')
-        D_asp = engine.setups.empty_atomic_matrix(1, engine.atom_partition)
+        for a, D_sii in matrices.items():
+            if D_sii.shape != (nspins, engine.setups[a].ni, engine.setups[a].ni):
+                raise ValueError('New CIDER density n/D spin shapes differ')
+        D_asp = engine.setups.empty_atomic_matrix(nspins, engine.atom_partition)
         for a, D_sii in matrices.items():
             D_asp[a][:] = [pack_density(D_ii.real) for D_ii in D_sii]
         engine.dens.D_asp = D_asp
+        self._nspins = nspins
         self._density = density
         self._paw_ready = False
 
@@ -379,18 +391,21 @@ class CiderNewMGGAFunctional(MGGAFunctional):
 
     def _calculate(self, nt_sr, taut_sr=None):
         self._paw_ready = False
-        if nt_sr.dims != (1,):
-            raise NotImplementedError('New CIDER does not support spin polarization')
+        if nt_sr.dims not in ((1,), (2,)):
+            raise NotImplementedError('New CIDER requires one or two collinear spins')
         if self._density is None:
             raise RuntimeError('New CIDER requires set_density before calculate')
         if taut_sr is None:
             raise ValueError('New CIDER requires tau including pseudo core tau')
+        if nt_sr.dims != (self._nspins,) or taut_sr.dims != nt_sr.dims:
+            raise ValueError('New CIDER n/tau/D spin shapes differ')
         for desc in (nt_sr.desc, taut_sr.desc):
             if desc.comm.size != 1 or any(not np.array_equal(getattr(desc, key),
                         getattr(self.grid, key)) for key in ('cell_cv', 'size_c', 'pbc_c')):
                 raise NotImplementedError('New CIDER does not support grid/cell changes')
-        if taut_sr.dims != (1,):
-            raise NotImplementedError('New CIDER does not support spin polarization')
+        if self._device is not None:
+            from ciderpress.gpu import preflight
+            preflight(self.engine.cider_kernel, self._nspins)
         xp = nt_sr.xp
         n = self._transfer(nt_sr, np, 'n_to_host')
         tau = self._transfer(taut_sr, np, 'tau_to_host')
@@ -423,6 +438,8 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         if not np.array_equal(D_sp, engine.dens.D_asp[a]):
             raise ValueError('New CIDER PAW density differs from grid evaluation')
         if dH_sp is not None:
+            if dH_sp.shape != D_sp.shape:
+                raise ValueError('New CIDER PAW D/dH spin shapes differ')
             dH_sp += engine.dH_asp_tmp[a]
         return float(engine.E_a_tmp[a])
 

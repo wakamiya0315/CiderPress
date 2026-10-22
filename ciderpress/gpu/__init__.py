@@ -94,3 +94,44 @@ def cupy():
     import cupy as _cupy
 
     return _cupy
+
+
+def preflight(kernel, nspins):
+    """Reject selected New-CIDER kernels that would fall back to the host.
+
+    The declared hybrid PAW algorithm still uses host fits and quadratures.
+    Selection dependencies are checked before any density evaluation.
+    """
+    if not is_enabled():
+        return
+    known = {'rbf', 'libxc', 'semilocal', 'pasdw', 'pasdw_fit',
+             'fine_grid', 'grid_xc', 'grid_nldf', 'nldf_fft'}
+    selection = os.environ.get('CIDER_GPU_KERNELS', 'all').strip()
+    selected = (known if selection == 'all' else set() if selection == 'none'
+                else {name.strip() for name in selection.split(',')})
+    unknown = selected - known
+    if unknown:
+        raise NotImplementedError('Unknown selected CIDER GPU kernels: ' + ','.join(sorted(unknown)))
+    if not selected:
+        return
+    if nspins not in (1, 2):
+        raise NotImplementedError('Selected CIDER GPU kernels require one or two spins')
+    for name, dependencies in {'semilocal': {'rbf', 'libxc'},
+                                'grid_xc': {'semilocal', 'rbf', 'libxc'},
+                                'grid_nldf': {'nldf_fft'},
+                                'pasdw_fit': {'pasdw'}}.items():
+        if name in selected and not dependencies <= selected:
+            raise NotImplementedError('Selected CIDER GPU kernel ' + name +
+                                      ' requires ' + ','.join(sorted(dependencies)))
+    from ciderpress.gpu.semilocal import supported
+    if selected & {'rbf', 'libxc', 'semilocal', 'pasdw'}:
+        if not supported(kernel.mlfunc, kernel.mlfunc.settings.nfeat):
+            raise NotImplementedError('Selected CIDER GPU kernel does not support this model/spin count')
+    if 'grid_xc' in selected:
+        from ciderpress.gpu.grid_xc import supported as grid_supported
+        if not grid_supported(kernel):
+            raise NotImplementedError('Selected CIDER GPU grid_xc does not support this model')
+    if selected & {'grid_nldf', 'nldf_fft', 'pasdw'}:
+        settings = kernel.mlfunc.settings.nldf_settings
+        if settings.version != 'j' or settings.sl_level != 'MGGA':
+            raise NotImplementedError('Selected CIDER GPU NLDF/PAW requires version-j MGGA')
