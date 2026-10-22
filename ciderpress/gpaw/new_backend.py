@@ -514,11 +514,121 @@ class CiderNewMGGAFunctional(MGGAFunctional):
                 del self._force_engine
                 raise
 
-    def stress_contribution(self, *args, **kwargs):
-        self.validate_stress_calculation()
+    def stress_contribution(self, ibzwfs=None, density=None, interpolate=None):
+        """Extensive XC tensor, evaluated once for replicated density.
+
+        All ranks enter the orbital tensor collectives.  Only global rank
+        zero evaluates CIDER; New performs the final sum and volume division.
+        """
+        if ibzwfs is None:
+            raise NotImplementedError('New CIDER stress requires wave functions')
+        from gpaw.new.xc import _taut
+        from gpaw.mpi import broadcast_exception
+        with broadcast_exception(ibzwfs.comm):
+            self.validate_stress_calculation()
+            if self._device is not None and ibzwfs.comm.size != 1:
+                raise NotImplementedError('New CIDER GPU stress requires one rank')
+            if density is not self._density:
+                raise RuntimeError('New CIDER stress density is stale')
+        T = _taut(ibzwfs, density.nt_sR.desc)
+        result = density.nt_sR.xp.zeros((3, 3))
+        with broadcast_exception(ibzwfs.comm):
+            if ibzwfs.comm.rank == 0:
+                result[:] = density.nt_sR.xp.asarray(
+                    self._stress_on_root(density, interpolate, T))
+        return result
 
     def validate_stress_calculation(self):
-        raise NotImplementedError('New CIDER stress is not implemented')
+        self.validate_force_calculation()
+        if not np.all(self.grid.pbc_c):
+            raise NotImplementedError('New CIDER stress requires periodic bulk')
+        state = getattr(self._density, 'tau_state', None)
+        if state is not None:
+            self.validate_tau_state_stress(state)
+        if not getattr(self, '_stress_stencil_checked', False):
+            from gpaw.fd_operators import gradient_strain_coefficients
+            for i in range(3):
+                for j in range(i, 3):
+                    strain = np.zeros((3, 3))
+                    strain[i, j] = strain[j, i] = 1. if i == j else .5
+                    gradient_strain_coefficients(self.grid._gd.h_cv, strain)
+            # Cell/grid changes are rejected by the existing SCF adapter.
+            self._stress_stencil_checked = True
+
+    def validate_tau_state_stress(self, state, ibzwfs=None):
+        """Certified joint-state bulk stress; never refresh or mix a state."""
+        self.validate_force_calculation()
+        if state is not getattr(self._density, 'tau_state', None):
+            raise RuntimeError('New CIDER stress tau state is stale')
+        if state.options.get('method') != 'joint':
+            raise NotImplementedError('New CIDER tau stress requires joint mixing')
+        if (self._device is not None and ibzwfs is not None and
+                ibzwfs.comm.size != 1):
+            raise NotImplementedError('New CIDER GPU stress requires one rank')
+        state.require_output()
+        residuals = state.residuals
+        if (not isinstance(residuals, dict) or
+                set(residuals) != {'density', 'tau', 'paw'} or
+                not all(np.isfinite(value) and 0 <= value <= 1e-7
+                        for value in residuals.values())):
+            raise RuntimeError('New CIDER stress requires current n/tau/D residuals <=1e-7')
+
+    def _stress_on_root(self, density, interpolate, T):
+        def host_interpolate(array):
+            xp = density.nt_sR.xp
+            staged = array if array.xp is xp else array.to_xp(xp)
+            return interpolate(staged).to_xp(np)
+
+        from ciderpress.gpu import policy
+        self.validate_stress_calculation()
+        if density is not self._density:
+            raise RuntimeError('New CIDER stress density is stale')
+        with policy(self._device):
+            # Use exactly the SCF interpolation and density packing.  Copies
+            # protect the caller even if a numerical routine raises midway.
+            fields = [interpolate(density.nt_sR), interpolate(density.taut_sR)]
+            for field in fields:
+                device = getattr(getattr(field, 'data', None), 'device', None)
+                device_id = getattr(device, 'id', None)
+                if self._device is not None and device_id is not None and device_id != self._device:
+                    raise ValueError('New CIDER input differs from its recorded CUDA device')
+            n, tau = [field.to_xp(np) for field in fields]
+            for array in (n, tau):
+                if array.dims != (1,) or any(
+                    not np.array_equal(getattr(array.desc, key), getattr(self.grid, key))
+                    for key in ('cell_cv', 'size_c', 'pbc_c')
+                ):
+                    raise NotImplementedError('New CIDER stress grid/spin changed')
+                if not np.isfinite(array.data).all():
+                    raise ValueError('New CIDER stress require finite inputs')
+            if _force_input_digest(n.data, tau.data) != self.engine._force_input_digest:
+                raise RuntimeError('New CIDER stress n/tau differs from the current XC state')
+            matrices = density.D_asii.to_xp(np)
+            if (matrices.layout.atomdist.comm.size != 1 or
+                    np.any(matrices.layout.atomdist.rank_a != 0) or
+                    set(matrices.keys()) != set(range(len(self.setups)))):
+                raise NotImplementedError('New CIDER stress atom distribution changed')
+            packed = self.engine.setups.empty_atomic_matrix(1, self.engine.atom_partition)
+            for a, D_sii in matrices.items():
+                packed[a][:] = [pack_density(D_ii.real) for D_ii in D_sii]
+                if not np.isfinite(packed[a]).all():
+                    raise ValueError('New CIDER stress require finite D')
+                if not np.array_equal(packed[a], self.engine.dens.D_asp[a]):
+                    raise RuntimeError('New CIDER stress D differs from the current XC state')
+            if not hasattr(self, '_stress_engine'):
+                self._stress_engine = _StressEngine(self.param, self.grid, self.grad_v,
+                                                   self.setups, self._relpos)
+            engine = self._stress_engine
+            try:
+                tensor = np.array([[host_interpolate(component).data
+                                    for component in spin] for spin in T])
+                return engine.stress(n.data.copy(), tau.data.copy(), packed,
+                                     tensor)
+            except BaseException:
+                # Never reuse a partially evaluated private engine.
+                del self._stress_engine
+                raise
+
 
 
 def _force_input_digest(n, tau):
@@ -570,3 +680,59 @@ class _ForceEngine(_Engine):
             self.force_terms['B'] = np.array([
                 np.einsum('vsiq,siq->v', self._save_v_avsiq[a], self._save_c_asiq[a])
                 for a in range(len(self.setups))])
+
+
+class _StressEngine(_ForceEngine):
+    """Independent mode-2 replay of explicit and smooth XC cell derivatives."""
+
+    def call_bwd(self, *args, **kwargs):
+        # Correct the inherited odd-nz multiplicity only in this private
+        # property engine; native SCF and force paths remain unchanged.
+        fft = self.fft_obj
+        if fft.shape[2] % 2 == 0:
+            return super().call_bwd(*args, **kwargs)
+        from ciderpress.gpaw.cider_paw import odd_fft_stress_correction
+
+        def real_work(buffer):
+            nx, ny, nz = fft.shape
+            count = nx * ny * int(fft._glda) * fft.nalpha
+            return buffer.view(np.float64)[:count].reshape(
+                nx, ny, int(fft._glda), fft.nalpha)[:, :, :nz].copy()
+
+        theta = [real_work(self._theta_s_gq[s]) for s in range(self.nspin)]
+        original = fft.compute_backward_convolution_with_stress
+        spin = 0
+
+        def corrected(saved):
+            nonlocal spin
+            correction = odd_fft_stress_correction(
+                fft, theta[spin], real_work(fft.copy_work_array()))
+            spin += 1
+            return original(saved) + correction
+
+        fft.compute_backward_convolution_with_stress = corrected
+        try:
+            return super().call_bwd(*args, **kwargs)
+        finally:
+            fft.compute_backward_convolution_with_stress = original
+
+    def stress(self, n, tau, packed, tensor):
+        from gpaw.xc.gga import stress_gradient_stencil_term
+        from ciderpress.gpaw.cider_paw import cider_smooth_stress
+        self.dens.nt_sg = n
+        self.dens.D_asp = packed
+        if tensor.shape != (len(n), 6) + n.shape[1:]:
+            raise ValueError('New CIDER stress tensor shape differs from n/tau')
+        if not np.isfinite(tensor).all():
+            raise ValueError('New CIDER stress requires a finite kinetic tensor')
+        e, rho, dedrho = self._get_cider_inputs(n, tau)
+        explicit = self.calc_cider(e, rho, dedrho, grad_mode=2)
+        smooth = cider_smooth_stress(self.gd, e, rho, dedrho, tensor)
+        stencil = stress_gradient_stencil_term(
+            self.gd, self.grad_v, n, rho[:, 1:4], dedrho[:, 1:4])
+        self.stress_terms = dict(explicit=0.5 * (explicit + explicit.T),
+                                 smooth=smooth, stencil=stencil)
+        result = sum(self.stress_terms.values())
+        if not np.isfinite(result).all():
+            raise ValueError('Nonfinite New CIDER XC stress')
+        return result
