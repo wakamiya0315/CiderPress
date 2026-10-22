@@ -89,3 +89,31 @@ def test_transfer_history_is_bounded():
         assert obj._transfer(array, np, str(i)) is array
     assert len(obj.transfer_timings) == 256
     assert obj.transfer_timings[0]['operation'] == '744'
+
+
+@pytest.mark.parametrize('nspins', [1, 2])
+def test_preflight_supported(fake_cuda, monkeypatch, nspins):
+    from ciderpress.gpaw.new_backend import CiderXC
+    from ciderpress.gpaw.cider_kernel import CiderMGGAHybridKernel
+    kernel = CiderMGGAHybridKernel(CiderXC().mlfunc, 1., None, None)
+    with gpu.policy(0):
+        for selection in ('all', 'none', 'rbf,libxc,semilocal', 'nldf_fft', 'pasdw'):
+            monkeypatch.setenv('CIDER_GPU_KERNELS', selection)
+            gpu.preflight(kernel, nspins)
+
+
+def test_preflight_rejects_fallback(fake_cuda, monkeypatch):
+    from ciderpress.gpaw.new_backend import CiderXC
+    from ciderpress.gpaw.cider_kernel import CiderMGGAHybridKernel
+    kernel = CiderMGGAHybridKernel(CiderXC().mlfunc, 1., None, None)
+    with gpu.policy(0):
+        for selection in ('unknown', 'semilocal', 'grid_xc', 'grid_nldf', 'pasdw_fit'):
+            monkeypatch.setenv('CIDER_GPU_KERNELS', selection)
+            with pytest.raises(NotImplementedError):
+                gpu.preflight(kernel, 2)
+        monkeypatch.setenv('CIDER_GPU_KERNELS', 'all')
+        with pytest.raises(NotImplementedError, match='spins'):
+            gpu.preflight(kernel, 4)
+        kernel.mlfunc.kernels[0].mode = 'POL'
+        with pytest.raises(NotImplementedError, match='model/spin'):
+            gpu.preflight(kernel, 2)

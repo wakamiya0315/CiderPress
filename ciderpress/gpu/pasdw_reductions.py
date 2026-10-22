@@ -109,8 +109,8 @@ def density(contrib, D):
         dn = cp.matmul(dlq, t[dnkey])
         n[:, :, 0] += np.sqrt(4*np.pi)/ns * t[core]
         dn[:, :, 0] += np.sqrt(4*np.pi)/ns * t[dcore]
-        # The supported New path is unpolarized. Keep the fallback explicit
-        # rather than silently omitting a polarized core hole.
+        # A polarized AE core hole belongs to opposite spin channels with
+        # opposite signs; the pseudo core remains unpolarized.
         if nkey == 'n_qg' and ns == 2 and x.nc_corehole_g is not None:
             sign = cp.asarray([-1., 1.])[:, None]
             n[:, :, 0] += sign * (0.5*np.sqrt(4*np.pi)*cp.asarray(x.nc_corehole_g))
