@@ -44,11 +44,13 @@ def test_interleaved_functionals_and_exceptions(fake_cuda):
         return obj
 
     a, b = functional(0), functional(None)
-    assert a.calculate(None) == (True, 0)
+    # GPU-owned functionals check their inputs' CUDA device before evaluation.
+    on0 = SimpleNamespace(data=SimpleNamespace(device=SimpleNamespace(id=0)))
+    assert a.calculate(on0, on0) == (True, 0)
     assert not gpu.is_enabled() and fake_cuda.cuda.Device().id == 3
     gpu.enable(2)
     assert b.calculate(None) == (False, 2)
-    assert a.calculate(None) == (True, 0)
+    assert a.calculate(on0, on0) == (True, 0)
     assert gpu.is_enabled() and fake_cuda.cuda.Device().id == 2
     assert a.calculate_paw_correction(None, None) == (True, 0)
 
@@ -58,7 +60,7 @@ def test_interleaved_functionals_and_exceptions(fake_cuda):
         raise RuntimeError('evaluation failed')
 
     a._calculate = a._calculate_paw_correction = fail
-    for call in (lambda: a.calculate(None), lambda: a.calculate_paw_correction(None, None)):
+    for call in (lambda: a.calculate(on0, on0), lambda: a.calculate_paw_correction(None, None)):
         with pytest.raises(RuntimeError, match='evaluation failed'):
             call()
         assert gpu.is_enabled() and fake_cuda.cuda.Device().id == 2
