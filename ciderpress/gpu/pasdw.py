@@ -1,7 +1,8 @@
 """Batched PASDW dense transforms behind their existing NumPy interfaces.
 
 All radial tables are evaluated by the original C/libm expressions on the
-host. Reductions preserve the C loop order (CUDA FMA contraction is disabled).
+host. Reductions preserve the C loop order (CUDA FMA contraction is disabled);
+the fixed radial pair explicitly uses FMA residuals for compensated sums.
 The ill-conditioned PAW basis fits and all Cholesky solves remain on the CPU.
 """
 
@@ -18,6 +19,56 @@ from ciderpress.gpu import cupy
 
 
 _SOURCE = r'''
+// Error-free products and a compensated sum retain the bits discarded by
+// FP64 quadrature/GEMM. Explicit fma is intentional despite --fmad=false.
+__device__ void radial_add(double ph, double pl, double& hi, double& lo) {
+    double s = hi + ph;
+    double v = s - hi;
+    double e = (hi - (s - v)) + (ph - v);
+    double t = (lo + pl) + e;
+    hi = s + t;
+    v = hi - s;
+    lo = (s - (hi - v)) + (t - v);
+}
+extern "C" __global__ void fixed_forward(
+    const double* x, const double* kh, const double* kl, const double* w,
+    const int* exponent, double* out, long long ns, long long nk, long long nlm, long long nu,
+    long long nq, long long rows, long long offset, long long l) {
+    long long t = (long long)blockDim.x * blockIdx.x + threadIdx.x;
+    long long nm = 2*l+1;
+    if (t >= ns*rows*nm*nq) return;
+    long long q = t%nq, m = t/nq%nm, row = t/(nq*nm)%rows;
+    long long s = t/(nq*nm*rows);
+    double hi = 0.0, lo = 0.0;
+    for (long long k = 0; k < nk; k++) {
+        double a = x[((s*nk+k)*nlm+l*l+m)*nq+q];
+        double bh = a*w[k], bl = fma(a, w[k], -bh);
+        long long j = row*nk+k;
+        double ph = kh[j]*bh;
+        double pl = fma(kh[j], bh, -ph) + (kh[j]*bl + kl[j]*bh);
+        radial_add(ph, pl, hi, lo);
+    }
+    out[(s*nu+offset+row*nm+m)*nq+q] = scalbn(hi+lo, exponent[row]);
+}
+extern "C" __global__ void fixed_adjoint(
+    const double* x, const double* kh, const double* kl, const int* exponent, double* out,
+    long long ns, long long nk, long long nlm, long long nu, long long nq,
+    long long rows, long long offset, long long l) {
+    long long t = (long long)blockDim.x * blockIdx.x + threadIdx.x;
+    long long nm = 2*l+1;
+    if (t >= ns*nk*nm*nq) return;
+    long long q = t%nq, m = t/nq%nm, k = t/(nq*nm)%nk;
+    long long s = t/(nq*nm*nk);
+    double hi = 0.0, lo = 0.0;
+    for (long long row = 0; row < rows; row++) {
+        double a = x[(s*nu+offset+row*nm+m)*nq+q];
+        long long j = row*nk+k;
+        double ph = kh[j]*a;
+        double pl = fma(kh[j], a, -ph) + kl[j]*a;
+        radial_add(ph, pl, hi, lo);
+    }
+    out[((s*nk+k)*nlm+l*l+m)*nq+q] = scalbn(hi+lo, exponent[k]);
+}
 extern "C" __global__ void rad2orb(
     const double* x, const double* table, const int* shell, const int* lm,
     double* out, long long ns, long long nr, long long nlm, long long nu, long long nq) {
@@ -280,11 +331,16 @@ def radial(owner, atco, r, nlm, x, to_orb):
 
 
 def fixed_radial(mapping, x, to_orb):
-    """The shared fixed K W / K.T pair, accumulated in device float64.
+    """The shared fixed K W / K.T pair with compensated device accumulation.
 
     K is constructed by RadialTransform on the host. Its immutable matrices
     own the cache, so setup reinitialization also discards device tables.
     Host callers retain the NumPy interface; pipeline callers stay on device.
+    Two FP64 words retain product and summation residuals, including the
+    forward quadrature product. Outputs are rounded once to FP64, like the
+    CPU longdouble path. No fitting/solve or CPU operation is changed.
+    Exact powers of two normalize each output's K vector before upload, so
+    tiny radial tails retain product residuals until the final FP64 store.
     """
     cp = cupy()
     if np.iscomplexobj(x) or x.ndim != (4 if to_orb else 3):
@@ -296,30 +352,40 @@ def fixed_radial(mapping, x, to_orb):
             raise ValueError('Radial grid shape changed')
     elif x.shape[1] != mapping.loc[-1]:
         raise ValueError('Orbital coefficient count changed')
-    matrices, weights = _cached(
-        mapping, 'fixed_radial', (),
-        lambda cp: (tuple(cp.asarray(np.asarray(a, dtype=np.float64))
-                          for a in mapping.matrices), cp.asarray(mapping.weights)))
+    def build(cp):
+        def scaled(matrix, axis):
+            exponent = np.frexp(np.max(abs(matrix), axis=axis, initial=0))[1]
+            shift = exponent[:, None] if axis == 1 else exponent[None, :]
+            normalized = np.ldexp(matrix, -shift)
+            high = np.ascontiguousarray(normalized, dtype=np.float64)
+            low = np.ascontiguousarray(normalized - high.astype(matrix.dtype), dtype=np.float64)
+            return cp.asarray(high), cp.asarray(low), cp.asarray(exponent, dtype=cp.int32)
+        matrices = []
+        for matrix in mapping.matrices:
+            matrices.append((scaled(matrix, 1), scaled(matrix, 0)))
+        return tuple(matrices), cp.asarray(mapping.weights)
+    matrices, weights = _cached(mapping, 'fixed_radial', (), build)
     device = isinstance(x, cp.ndarray)
-    values = cp.asarray(x)
+    values = _device_array(x)
     ns, nq, nk = len(x), x.shape[-1], mapping.nk
     shape = (ns, mapping.loc[-1], nq) if to_orb else (ns, nk, mapping.nlm, nq)
     out = cp.zeros(shape, dtype=cp.float64)
     if nq:
-        for l, matrix in enumerate(matrices):
-            if not len(matrix):
+        for l, pair in enumerate(matrices):
+            high, low, exponent = pair[0 if to_orb else 1]
+            rows = len(high)
+            if not rows:
                 continue
             nm = 2*l+1
-            a, b = mapping.loc[l:l+2]
+            ints = tuple(np.int64(i) for i in
+                         (ns, nk, mapping.nlm, mapping.loc[-1], nq,
+                          rows, mapping.loc[l], l))
             if to_orb:
-                block = values[:, :, l*l:(l+1)**2] * weights[None, :, None, None]
-                projected = matrix @ block.transpose(1, 0, 2, 3).reshape(nk, -1)
-                out[:, a:b] = projected.reshape(len(matrix), ns, nm, nq).transpose(
-                    1, 0, 2, 3).reshape(ns, len(matrix)*nm, nq)
+                _launch('fixed_forward', ns*rows*nm*nq,
+                        (values, high, low, weights, exponent, out, *ints))
             else:
-                block = values[:, a:b].reshape(ns, len(matrix), nm, nq)
-                projected = matrix.T @ block.transpose(1, 0, 2, 3).reshape(len(matrix), -1)
-                out[:, :, l*l:(l+1)**2] = projected.reshape(nk, ns, nm, nq).transpose(1, 0, 2, 3)
+                _launch('fixed_adjoint', ns*nk*nm*nq,
+                        (values, high, low, exponent, out, *ints))
     return out if device else cp.asnumpy(out)
 
 
