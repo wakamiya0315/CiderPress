@@ -6,7 +6,8 @@ See README.md for record conventions, constraints and the SCF callback contract.
 """
 
 from .data import ReactionSet
+from .io import write_records
 from .records import from_pyscf
 from .tuner import Constraints, FineTuner
 
-__all__ = ["Constraints", "FineTuner", "ReactionSet", "from_pyscf"]
+__all__ = ["Constraints", "FineTuner", "ReactionSet", "from_pyscf", "write_records"]
