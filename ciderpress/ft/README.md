@@ -53,8 +53,9 @@ fixed density, orbitals and original functional. Use converged, qualified
 states and consistent geometry, setups, magnetism and energy conventions.
 
 `ReactionSet.from_hdf5(directories, system_ids, compositions=...)` reads the
-REF/SL/NLDF layout written by `ciderpress.gpaw.new_export.write_training_data`.
-An unused pointwise `val` reference is not required. Every system participating
+REF/SL/NLDF layout written by `ciderpress.gpaw.new_export.write_training_data`
+or the GPAW-free `ciderpress.ft.write_records`. An unused pointwise `val`
+reference is not required. Every system participating
 in a reaction needs `composition` (formula or element/count mapping),
 `symbols`, or `numbers`. Elemental imbalance raises an error. For charged
 reactions, electronic/charge balance remains the caller's responsibility.
@@ -79,8 +80,72 @@ protect_set = ReactionSet.from_records({"H2": record})
 It exports SL+NLDF, raw density, all-electron weights, energies and atomic
 numbers. HF, hybrids, NLC and dispersion are refused by this convenience
 adapter. It uses the analyzer's separate grid, so grid convergence and
-small-energy quadrature agreement still need qualification. General custom
-exporters may supply the same record schema. Feature count is checked;
+small-energy quadrature agreement still need qualification. This default
+behavior, including `grids_level`, is unchanged.
+
+To retain the exact SCF quadrature, including custom pruning and point order:
+
+```python
+from ciderpress.ft import write_records
+
+record = from_pyscf(
+    mf, grids=mf.grids,
+    provenance={
+        "df": {"enabled": True, "auxbasis": "def2-universal-jfit"},
+        "grid": {"source": "SCF", "level": mf.grids.level},
+        "model_sha256": model_sha,
+        "versions": versions,
+    },
+)
+directories = write_records({"H2": record}, "training")
+data = ReactionSet.from_hdf5(directories, ["H2"])
+# Equivalently: directories = data.to_hdf5("training-copy")
+```
+
+Use actual DF/grid/version information from the generating calculation in
+`provenance`; no provenance is inferred automatically. Its dictionary has no
+required keys and does not affect fitting. It is stored as JSON in
+`REF/<id>.hdf5:/train_data/provenance_json` and restored to `provenance` by
+`ReactionSet.from_hdf5`. JSON values (nested dictionaries/lists, strings,
+numbers, booleans and `None`) are supported; NumPy scalars/arrays become JSON
+scalars/lists. Python objects such as grid-pruning callables should be named
+explicitly instead of serialized. Original atomic numbers/order and
+`feature_settings_yaml` from `from_pyscf` are retained. For custom records,
+provide `nfeat_sl` to split the descriptor blocks and include feature settings
+when available. Missing atomic numbers are derived from composition/symbols;
+composition alone does not specify atomic order.
+
+The writer returns all six directory keys expected by `MOLGP2.load_data`,
+with unused feature families set to `None`. Both readers retain identical
+`desc`, `rho_data` and signed `wt` arrays. Existing files for supplied IDs are
+replaced. Reactions/labels in a `ReactionSet` are not serialized. Pointwise
+`val` is omitted by default even if present in a record; `include_val=True`
+writes an existing finite pointwise array. No EXX computation is performed.
+`MOLGP2.load_data(directories, id, False)` can read files without `val`;
+the separate legacy `store_mol_covs` reference path still requires it.
+
+Alternatively pass `grid_spec={"level": 3, "prune": None, ...}` to build a
+grid, or `analyzer=ana` to reuse a prepared matching-density analyzer. An
+analyzer is mutually exclusive with grid options; a grid object is mutually
+exclusive with `grid_spec`/`grids_level`. The supplied grids must already be
+built. Explicit-grid export compares **both coordinates and weights**, not
+just the grid level. Identical grids reuse saved `mf.e_tot` and
+`mf.scf_summary["exc"]` without an extra CPU energy/XC evaluation. Different
+grids reevaluate only XC using a private copy of the generating integrator
+and adjust `e_tot_orig` by the same XC difference, preserving `e_tot-exc`.
+The saved SCF scalars must be present. CIDER grid specifications retain the
+SCF's `CiderGrids` family; supplied grids on a different quadrature must also
+be compatible with the generating XC integrator.
+
+`feature_generator=callable` replaces `get_descriptors`. The callable receives
+`(analyzer, settings)` for SL, NLDF and raw density (`settings="l"`), and must
+return the same raw arrays/order/spin scaling. For example, a wrapper can
+pass an audited inner NLDF grid and convolution settings only on the NLDF
+call. This controls descriptor generation separately from the outer sampling
+grid. These options support CPU PySCF objects; transferring a GPU SCF state
+and qualifying its density, grid and energy remain the caller's responsibility.
+
+General custom exporters may supply the same record schema. Feature count is checked;
 `feature_settings_yaml` is compared when supplied by this adapter. Legacy
 GPAW records without that field cannot prove transform/settings identity;
 the caller must ensure they used the frozen model's settings. The SCF model

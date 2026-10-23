@@ -113,13 +113,19 @@ class ReactionSet:
 
     @classmethod
     def from_hdf5(cls, directories, system_ids, *, compositions=None):
-        """Load the REF/SL/NLDF directories written by new_export's writer."""
+        """Load REF/SL/NLDF from ft or new_export, including optional provenance."""
         from ciderpress.models.train import MOLGP
 
         return cls.from_records(
             {key: MOLGP.load_data(directories, key, False) for key in system_ids},
             compositions=compositions,
         )
+
+    def to_hdf5(self, directory, *, include_val=False):
+        """Write records only (not reactions); return the MOLGP directory mapping."""
+        from .io import write_records
+
+        return write_records(self.records, directory, include_val=include_val)
 
     def _check_terms(self, terms, *, balanced=True):
         if not terms or any(not np.isfinite(c) or c == 0 for c in terms.values()):
