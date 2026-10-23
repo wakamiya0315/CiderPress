@@ -121,11 +121,9 @@ def _perturb_calc_density_(calc, p, delta):
 
 
 def _rotate_orbs_(calc, s, k, n1, n2, delta):
-    nspin = calc.density.nt_sg.shape[0]
     wfs = calc.wfs
-    rank, q = wfs.kd.who_has(k)
+    rank, u = wfs.kd.who_has(k, s)
     if wfs.kd.comm.rank == rank:
-        u = q * nspin + s
         kpt = wfs.kpt_u[u]
         assert kpt.s == s
         assert kpt.k == k
@@ -147,11 +145,9 @@ def _rotate_orbs_(calc, s, k, n1, n2, delta):
 
 
 def _reset_orbs_(calc, s, k, n1, n2, psi1, psi2):
-    nspin = calc.density.nt_sg.shape[0]
     wfs = calc.wfs
-    rank, q = wfs.kd.who_has(k)
+    rank, u = wfs.kd.who_has(k, s)
     if wfs.kd.comm.rank == rank:
-        u = q * nspin + s
         kpt = wfs.kpt_u[u]
         assert kpt.s == s
         assert kpt.k == k
