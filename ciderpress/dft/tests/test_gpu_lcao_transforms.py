@@ -125,3 +125,87 @@ def test_negative_active_tau_rejected(device):
     before=cp.asnumpy(rho).tobytes()
     nl.get_features(rho)
     assert before==cp.asnumpy(rho).tobytes()
+
+
+@pytest.mark.parametrize("reduction",["accurate","dd_serial"])
+def test_atc_global_cancellation_decimal_and_adjoint(device,reduction):
+    """A lost cross-shell residual cannot be recovered by per-shell DD."""
+    from decimal import Decimal, localcontext
+    from ciderpress.gpu.lcao_kernels import MolecularTransforms
+    cp=device
+    # Minimal owned transform snapshot; odd q, multiple m and input shells,
+    # rectangular table, additive C and both requested matrix directions.
+    t=object.__new__(MolecularTransforms)
+    t.q=7;t.nao={"in":9,"out":6};t.reduction=reduction
+    t.device=cp.cuda.Device().id;t._stream_ptr=cp.cuda.get_current_stream().ptr
+    rng=np.random.default_rng(719)
+    a=rng.normal(size=(14,21))
+    a[:,0]=1e16;a[:,7]=1.;a[:,14]=-1e16
+    t.atc=[(1,slice(0,9),slice(0,6),cp.asarray(a))]
+    x=rng.normal(size=(9,7));x[:,0]=1
+    y=rng.normal(size=(6,7))
+    hashes=[]
+    for forward,inp in [(True,x),(False,y)]:
+        matrix=a if forward else a.T
+        nsrc,ndst=matrix.shape[1]//7,matrix.shape[0]//7
+        initial=rng.normal(size=(ndst*3,7))
+        with localcontext() as context:
+            context.prec=80
+            expected=np.empty_like(initial)
+            for j in range(ndst):
+                for m in range(3):
+                    vector=inp.reshape(nsrc,3,7)[:,m].ravel()
+                    for k in range(7):
+                        exact=Decimal.from_float(initial[j*3+m,k])+sum(
+                            (Decimal.from_float(v)*Decimal.from_float(w)
+                             for v,w in zip(vector,matrix[j*7+k])),Decimal(0))
+                        expected[j*3+m,k]=float(exact)
+        got=t.atc_transform(cp.asarray(inp),forward=forward,out=cp.asarray(initial))
+        # DD has ~106 bits, not unlimited precision or a correct-rounding
+        # guarantee after cancellation by 1e16. Allow one FP64 ulp or the
+        # small absolute DD residual; ordinary GEMM loses order-one terms.
+        error=np.abs(cp.asnumpy(got)-expected)
+        assert np.all(error<=np.maximum(np.spacing(np.abs(expected)),4e-15))
+        again=t.atc_transform(cp.asarray(inp),forward=forward,out=cp.asarray(initial))
+        assert cp.asnumpy(got).tobytes()==cp.asnumpy(again).tobytes()
+    # Use ordinary-sized coefficients for a sensitive transpose identity.
+    t.atc=[(1,slice(0,9),slice(0,6),cp.asarray(a/1e16))]
+    lhs=float(cp.vdot(t.atc_transform(cp.asarray(x)),cp.asarray(y)))
+    rhs=float(cp.vdot(cp.asarray(x),t.atc_transform(cp.asarray(y),forward=False)))
+    np.testing.assert_allclose(lhs,rhs,rtol=1e-14,atol=1e-14)
+
+
+def test_input_radial_dd_decimal_with_offsets(device):
+    from decimal import Decimal,localcontext
+    from ciderpress.gpu.lcao_kernels import MolecularTransforms
+    cp=device;rng=np.random.default_rng(331)
+    t=object.__new__(MolecularTransforms)
+    t.q=7;t.nrad=9;t.nlm=4;t.nao={"in":6};t.reduction="accurate"
+    t.device=cp.cuda.Device().id;t._stream_ptr=cp.cuda.get_current_stream().ptr
+    b=rng.normal(size=(2,9));b[:,0]=1e16;b[:,4]=1;b[:,-1]=-1e16
+    t.basis={"in":[(0,1,slice(0,6),slice(0,9),cp.asarray(b))]}
+    x=rng.normal(size=(9,4,7));x[0]=1;x[-1]=1
+    initial=rng.normal(size=(6,10));expected=initial.copy()
+    with localcontext() as context:
+        context.prec=80
+        for j in range(2):
+            for m in range(3):
+                for k in range(7):
+                    exact=Decimal.from_float(initial[j*3+m,k+2])+sum(
+                        (Decimal.from_float(b[j,r])*Decimal.from_float(x[r,m+1,k])
+                         for r in range(9)),Decimal(0))
+                    expected[j*3+m,k+2]=float(exact)
+    got=t.radial_transform(cp.asarray(x),'in',out=cp.asarray(initial),offset=2,zero_output=False)
+    assert np.all(np.abs(cp.asnumpy(got)-expected)<=np.maximum(np.spacing(np.abs(expected)),4e-15))
+    y=rng.normal(size=(6,10));initial=rng.normal(size=x.shape);expected=initial.copy()
+    with localcontext() as context:
+        context.prec=80
+        for r in range(9):
+            for m in range(3):
+                for k in range(7):
+                    exact=Decimal.from_float(initial[r,m+1,k])+sum(
+                        (Decimal.from_float(b[j,r])*Decimal.from_float(y[j*3+m,k+2])
+                         for j in range(2)),Decimal(0))
+                    expected[r,m+1,k]=float(exact)
+    got=t.radial_transform(cp.asarray(y),'in',forward=False,out=cp.asarray(initial),offset=2,zero_output=False)
+    assert np.all(np.abs(cp.asnumpy(got)-expected)<=np.maximum(np.spacing(np.abs(expected)),4e-15))

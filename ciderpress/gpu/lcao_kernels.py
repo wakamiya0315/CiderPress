@@ -116,6 +116,21 @@ extern "C" __global__ void atc_ordered(
     }
     out[t]=v;
 }
+extern "C" __global__ void radial_dd(
+    const double* x, const double* b, double* out, long long nr, long long ns,
+    long long nm, long long q, long long stride, long long offset, long long forward) {
+    long long t=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(t>=(forward ? ns : nr)*nm*q)return;
+    long long k=t%q,m=t/q%nm,j=t/(nm*q);
+    long long dst=forward ? (j*nm+m)*stride+offset+k : t;
+    dd sum={out[dst],0};
+    for(long long i=0;i<(forward ? nr : ns);i++) {
+        double c=forward ? b[j*nr+i] : b[i*nr+j];
+        double v=forward ? x[(i*nm+m)*q+k] : x[(i*nm+m)*stride+offset+k];
+        sum=dadd(sum,dmul({c,0},{v,0}));
+    }
+    out[dst]=sum.h+sum.l;
+}
 extern "C" __global__ void atc_precise(
     const double* x, const double* table, double* out, long long ni, long long no,
     long long nm, long long q, long long forward, long long lanes) {
@@ -139,6 +154,42 @@ extern "C" __global__ void atc_precise(
         }
     }
     out[t]=v;
+}
+// Accumulate across ALL shells and exponents before the sole FP64 rounding.
+// Explicit product residuals retain cancellation that a compensated sum of
+// already-rounded products (or a DD sum rounded between shells) would lose.
+// The table is row-major in the requested direction, including the adjoint.
+extern "C" __global__ void atc_full_dd(
+    const double* x, const double* table, double* out, long long nsrc,
+    long long ndst, long long nm, long long q) {
+    long long t=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(t>=ndst*nm*q)return;
+    long long k=t%q,m=t/q%nm,j=t/(nm*q);
+    dd sum={out[t],0};
+    for(long long i=0;i<nsrc*q;i++)
+        sum=dadd(sum,dmul({table[(j*q+k)*(nsrc*q)+i],0},
+                         {x[(i/q*nm+m)*q+i%q],0}));
+    out[t]=sum.h+sum.l;
+}
+extern "C" __global__ void atc_warp_dd(
+    const double* x, const double* table, double* out, long long nsrc,
+    long long ndst, long long nm, long long q) {
+    long long thread=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    long long t=thread/32; int lane=threadIdx.x%32;
+    if(t>=ndst*nm*q)return; // All lanes of this warp take the same branch.
+    long long k=t%q,m=t/q%nm,j=t/(nm*q);
+    dd sum={0,0};
+    for(long long i=lane;i<nsrc*q;i+=32)
+        sum=dadd(sum,dmul({table[(j*q+k)*(nsrc*q)+i],0},
+                         {x[(i/q*nm+m)*q+i%q],0}));
+    // Fixed binary tree, with no atomics, scheduling-dependent partials, or
+    // intermediate FP64 collapse. All lanes participate in every shuffle.
+    for(int step=16;step;step/=2) {
+        dd other={__shfl_down_sync(0xffffffff,sum.h,step),
+                  __shfl_down_sync(0xffffffff,sum.l,step)};
+        if(lane<step)sum=dadd(sum,other);
+    }
+    if(lane==0) { sum=dadd(sum,{out[t],0}); out[t]=sum.h+sum.l; }
 }
 extern "C" __global__ void atc_emulate(
     const double* x,const double* table,double* out,long long ni,long long no,
@@ -320,18 +371,22 @@ class MolecularTransforms:
 
     resident: native Y uploaded once. tiled: compact directions resident and
     Y regenerated per grid tile on device; no host streaming in an evaluation.
-    Both use ordinary deterministic FP64 cuBLAS GEMMs, no split-K/atomics.
+    Both default to a fixed warp-tree double-double ATC reduction and DD
+    input-basis radial transforms (both directions). Other transforms use
+    ordinary deterministic FP64 cuBLAS GEMMs, no atomics.
+    reduction="gemm" explicitly selects the original all-GEMM comparison;
+    reduction="dd_serial" selects a serial global-DD ATC comparison.
     Reset by constructing a new object when geometry/grid/settings change.
     """
 
-    def __init__(self, generator, *, schedule="resident", tile_size=65536,reduction="gemm"):
+    def __init__(self, generator, *, schedule="resident", tile_size=65536,reduction="accurate"):
         from ciderpress.gpu.lcao_tables import (extract_atc, basis_groups,
                                                radial_tables, geometry_digest)
         cp = cupy()
         if schedule not in ("resident", "tiled") or not isinstance(tile_size, int) or tile_size < 1:
             raise ValueError("Need resident/tiled schedule and a positive tile size")
         self.schedule, self.tile_size = schedule, tile_size
-        if reduction not in ("gemm","native_order","angular","radial","atc","spline",
+        if reduction not in ("accurate","atc_accurate","dd_serial","gemm","native_order","angular","radial","atc","spline",
                              "atc_dd","atc_2","atc_4","atc_8","native_dd","angular_nf","native_nf") and not reduction.startswith("em"):
             raise ValueError("Unknown molecular reduction schedule")
         self.reduction=reduction
@@ -441,8 +496,9 @@ class MolecularTransforms:
             if zero_output: out[:,offset:offset+q] = 0
             for a,l,us,rs,b in self.basis[label]:
                 compact=cp.ascontiguousarray(x[rs,l*l:(l+1)**2])
-                if self._ordered("radial"):
-                    launch("radial_ordered",(us.stop-us.start)*q,(compact,b,out[us],
+                compensated = label == "in" and self.reduction == "accurate"
+                if self._ordered("radial") or compensated:
+                    launch("radial_dd" if compensated else "radial_ordered",(us.stop-us.start)*q,(compact,b,out[us],
                         *(np.int64(v) for v in (b.shape[1],b.shape[0],2*l+1,q,out.shape[-1],offset,1))))
                 else:
                     value = self.gemm(b, compact.reshape(b.shape[1],-1))
@@ -457,9 +513,10 @@ class MolecularTransforms:
             if zero_output: out.fill(0)
             for a,l,us,rs,b in self.basis[label]:
                 nm = 2*l+1
-                if self._ordered("radial"):
+                compensated = label == "in" and self.reduction == "accurate"
+                if self._ordered("radial") or compensated:
                     compact=cp.ascontiguousarray(out[rs,l*l:(l+1)**2])
-                    launch("radial_ordered",compact.size,(x[us],b,compact,
+                    launch("radial_dd" if compensated else "radial_ordered",compact.size,(x[us],b,compact,
                         *(np.int64(v) for v in (b.shape[1],b.shape[0],nm,q,x.shape[-1],offset,0))))
                     out[rs,l*l:(l+1)**2]=compact
                 else:
@@ -476,7 +533,17 @@ class MolecularTransforms:
         for l,ins,outs,t in self.atc:
             src,dst = (ins,outs) if forward else (outs,ins)
             nm = 2*l+1
-            if self.reduction.startswith("em"):
+            if self.reduction in ("accurate", "atc_accurate", "dd_serial"):
+                # Orient on device for coalesced reads in both directions.
+                # No persistent transpose: cloned/odd-q tables remain valid,
+                # and the resident memory footprint is unchanged.
+                matrix = t if forward else cp.ascontiguousarray(t.T)
+                warp = self.reduction != "dd_serial"
+                launch("atc_warp_dd" if warp else "atc_full_dd",
+                       out[dst].size*(32 if warp else 1),
+                       (x[src],matrix,out[dst],*(np.int64(v) for v in
+                        ((src.stop-src.start)//nm,(dst.stop-dst.start)//nm,nm,q))))
+            elif self.reduction.startswith("em"):
                 mode=int(self.reduction[2:])
                 launch("atc_emulate",out[dst].size,(x[src],t,out[dst],
                     *(np.int64(v) for v in ((ins.stop-ins.start)//nm,(outs.stop-outs.start)//nm,nm,q,forward,mode))))
