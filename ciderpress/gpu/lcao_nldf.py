@@ -4,6 +4,9 @@ All setup is explicit and CPU tables are immutable snapshots. Reconstruct
 after any geometry/grid/basis/plan change. Inputs are full-grid device FP64
 rho (5,N)/(2,5,N), CiderGrids order; returns per-particle exc and unweighted
 eval_xc_eff potential. This does not implement a gpu4pyscf SCF frontend.
+The default reduction="accurate" uses global double-double ATC and input
+radial transforms in both directions; reduction="gemm" retains the original
+FP64 cuBLAS comparison.
 """
 import numpy as np
 
@@ -14,14 +17,14 @@ from ciderpress.gpu.pasdw_exponents import arguments
 
 
 class MolecularNLDF:
-    def __init__(self,generator,*,schedule="resident",tile_size=65536):
+    def __init__(self,generator,*,schedule="resident",tile_size=65536,reduction="accurate"):
         validate_plan(generator.plan)
         if cupy().cuda.runtime.getDeviceCount() != 1:
             raise NotImplementedError("Molecular NLDF requires one visible CUDA device")
         if not generator.interpolator.onsite_direct or generator.interpolator._n1:
             raise NotImplementedError("Only direct on-site, scalar version-j interpolation")
         self.plan = ResidentPlan(generator.plan)
-        self.transforms = MolecularTransforms(generator,schedule=schedule,tile_size=tile_size)
+        self.transforms = MolecularTransforms(generator,schedule=schedule,tile_size=tile_size,reduction=reduction)
         self.cache = {}
 
     def get_features(self,rho,spin=0,*,map_grids=True,grad_mode=False):
@@ -89,10 +92,10 @@ def validate_model(ni):
 
 
 class MolecularXC:
-    def __init__(self,ni,weights,*,schedule="resident",tile_size=65536):
+    def __init__(self,ni,weights,*,schedule="resident",tile_size=65536,reduction="accurate"):
         validate_model(ni)
         self.device = cupy().cuda.Device().id
-        self.nldf = MolecularNLDF(ni.nldfgen,schedule=schedule,tile_size=tile_size)
+        self.nldf = MolecularNLDF(ni.nldfgen,schedule=schedule,tile_size=tile_size,reduction=reduction)
         self.model,self.rhocut = ni.mlxc,ni.rhocut
         self.constants = tuple(1. if n is None else n.const for n in ni.settings.normalizers._normalizers)
         self.weights = cupy().asarray(np.array(weights,copy=True))
