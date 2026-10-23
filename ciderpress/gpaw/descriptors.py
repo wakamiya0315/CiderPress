@@ -253,10 +253,9 @@ def calculate_single_orbital_atomic_density_matrix(self, D_aop, p_o, nspin):
         D_op[:] = 0.0
         for o, p in enumerate(p_o):
             # Get the apprropriate k-point index on this rank
-            rank, q = self.kd.who_has(p[1])
+            s = p[0]
+            rank, u = self.kd.who_has(p[1], s)
             if self.kd.comm.rank == rank:
-                s = p[0]
-                u = q * nspin + s
                 kpt = self.kpt_u[u]
                 assert kpt.s == s
                 assert kpt.k == p[1]
@@ -311,6 +310,7 @@ class FixedKOccupationNumbers(OccupationNumberCalculator):
         nelectrons,
         eig_qn,
         weight_q,
+        spin_q,
         f_qn,
         fermi_level_guess=np.nan,
         fix_fermi_level=False,
@@ -522,7 +522,6 @@ def get_features_and_weights_deriv(
 
 def get_drho_df(calc, p_i):
     dens = calc.density
-    nspin = dens.nt_sg.shape[0]
     wfs = calc.wfs
     assert isinstance(dens, ReciprocalSpaceDensity)
     shape = (len(p_i), 4)
@@ -530,9 +529,8 @@ def get_drho_df(calc, p_i):
     imag_ixR = wfs.gd.zeros(shape)
     drhodf_ixR = wfs.gd.zeros((len(p_i), 5))
     for i, (s, k, n) in enumerate(p_i):
-        rank, q = wfs.kd.who_has(k)
+        rank, u = wfs.kd.who_has(k, s)
         if wfs.kd.comm.rank == rank:
-            u = q * nspin + s
             kpt = wfs.kpt_u[u]
             assert kpt.s == s
             assert kpt.k == k
