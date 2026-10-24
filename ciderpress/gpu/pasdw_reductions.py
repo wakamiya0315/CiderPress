@@ -7,7 +7,8 @@ remain separate until independent linear operations are folded together.
 import numpy as np
 
 from ciderpress.gpu import cupy
-from ciderpress.gpu.pasdw import _cached, _signature, _table_revision, contract_gradient
+from ciderpress.gpu.pasdw import (_cached, _signature, _table_revision,
+                                 contract_gradient, density_projection)
 
 
 def spherical(indexer, x, to_radial):
@@ -99,7 +100,7 @@ def density(contrib, D):
     # kinetic tables instead of hashing and uploading them twice more.
     contrib._pasdw_cycle_tables = t
     d = cp.asarray(D)
-    dlq = cp.matmul(d, t['B_pqL'].reshape(d.shape[-1], -1)).reshape(
+    dlq = density_projection(d, t['B_pqL'].reshape(d.shape[-1], -1)).reshape(
         *d.shape[:2], t['B_pqL'].shape[1], nlm).swapaxes(-1, -2)
     out = []
     for nkey, dnkey, core, dcore, tau, tauc in (
@@ -156,8 +157,14 @@ def finish(contrib, values, energy=False, _tables=None):
             kinetic.append(cp.asnumpy(cp.matmul(cp.asarray(flat[:, 4])*table[1], table[0].T)))
         if energy:
             energies.append(np.array([x.rgd.integrate(row.reshape(-1, len(weight_n)).dot(weight_n)) for row in e]))
-    dh = np.inner((terms[0]-terms[1]).reshape(count*ns, -1),
-                  x.B_pqL.reshape(len(x.B_pqL), -1))
+    if _tables is None:
+        revision = _table_revision(contrib, 'density_projection_B', x.B_pqL)
+        b = _cached(contrib, 'density_projection_B', revision,
+                    lambda cp: cp.asarray(x.B_pqL))
+    else:
+        b = _tables['B_pqL']
+    dh = cp.asnumpy(density_projection((terms[0]-terms[1]).reshape(count*ns, -1),
+                                      b.reshape(len(x.B_pqL), -1).T))
     if kinetic:
         dh += kinetic[0] - kinetic[1]
     dh = dh.reshape(count, ns, -1)
