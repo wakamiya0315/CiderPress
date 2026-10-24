@@ -73,20 +73,32 @@ def blocks(record, settings, blocksize):
         yield x, rho, record["wt"][start:end]
 
 
-def integrate(model, record, *, blocksize=4000, rhocut=1e-8, core=True):
+def integrate(model, record, *, blocksize=4000, rhocut=1e-8, core=True, device="cpu"):
     """MappedXC2 integral in Ha; the unchanged core constant is added once."""
+    if device == "gpu":
+        from ._gpu import integrate as integrate_gpu
+
+        return integrate_gpu(model, record, blocksize, rhocut, core)
+    if device != "cpu":
+        raise ValueError("device must be 'cpu' or 'gpu'")
     energy = record["exc_core"] if core else 0.0
     for x, rho, wt in blocks(record, model.settings, blocksize):
         energy += float(model(x, rho, rhocut=rhocut)[0] @ wt)
     return energy
 
 
-def covariance(kernel, record, settings, blocksize, rhocut):
+def covariance(kernel, record, settings, blocksize, rhocut, *, device="cpu"):
     """Use DFTKernel2 for the same signed integral and cutoff as MappedXC2.
 
     The training loader's fixed 1e-6 mask differs from inference, so the wrapper
     constructs energy covariances explicitly with the inference cutoff.
     """
+    if device == "gpu":
+        from ._gpu import covariance as covariance_gpu
+
+        return covariance_gpu(kernel, record, settings, blocksize, rhocut)
+    if device != "cpu":
+        raise ValueError("device must be 'cpu' or 'gpu'")
     result = np.zeros(kernel.Nctrl)
     for x, rho, wt in blocks(record, settings, blocksize):
         m = kernel.multiplicative_baseline(rho)[0]
@@ -114,7 +126,9 @@ def physical_atomic_numbers(mol):
         [gto.charge(mol.atom_pure_symbol(i)) for i in range(mol.natm)], dtype=int
     )
     if numbers.size == 0 or np.any(numbers <= 0):
-        raise ValueError("physical atomic numbers are required; ghost atoms unsupported")
+        raise ValueError(
+            "physical atomic numbers are required; ghost atoms unsupported"
+        )
     return numbers
 
 

@@ -297,6 +297,35 @@ before scientific use of a fitted model.
 
 ## Verification
 
+### Optional CUDA fitting and prediction
+
+This path is experimental: the p12-ftgpu real-record audit found FP64
+quadrature differences amplified beyond its 1e-10 coefficient/prediction gate.
+Use the CPU default for that pilot until the strict fit gate is qualified.
+
+`FineTuner(..., device="gpu")` selects CuPy FP64 grid quadratures. The default
+`device="cpu"` retains the original arithmetic, control selection, dense solve
+and YAML format. `FineTuner.load(path, device="gpu")` selects the device again;
+device choice is an execution option and is not stored in the model. Loading
+without that option always uses CPU, including a model fitted on GPU.
+
+The GPU route reuses `ciderpress.gpu.semilocal.evaluate_device` (the mapped
+model pipeline used by New GPAW), its feature maps and libxc baselines. FT's
+residual covariance uses a blocked ordinary RBF distance matrix on device.
+`blocksize` bounds the number of grid points; covariance workspace scales as
+`O(blocksize * nspin * n_control)`, independently of total grid size. Input
+normalization, deterministic candidate sampling/control selection and the
+small dense solve remain on CPU. Signed PAW weights, spin scaling, density
+cutoffs and the one-time core constant are retained.
+
+Explicit GPU selection requires real CuPy and a CUDA device, and raises on
+unsupported kernels or runtime errors. FT calls the resident pipeline directly,
+so `CIDER_GPU_KERNELS` does not disable this explicit request. CPU/GPU reduction
+roundoff can differ; validate the application and conditioning of each fit.
+GPU tests in `test_gpu.py` skip when CuPy/CUDA is unavailable. The optional
+`benchmark_gpu.py` consumes a frozen Stage C catalog using the bench's unchanged
+`harness.p12_ftC`; it writes timings and comparison arrays without running SCF.
+
 Run `python -m pytest ciderpress/ft/tests -q` in a built CiderPress environment.
 Tests cover known-correction recovery (SEP/NPOL, one/two spins), refit
 invariance, units, splits, molecular/UEG/absolute safeguards, SCF label

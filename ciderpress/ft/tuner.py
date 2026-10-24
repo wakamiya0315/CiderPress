@@ -118,7 +118,15 @@ class FineTuner:
         blocksize=4000,
         rhocut=1e-8,
         jitter=1e-12,
+        device="cpu",
     ):
+        if device not in ("cpu", "gpu"):
+            raise ValueError("device must be 'cpu' or 'gpu'")
+        if device == "gpu":
+            from ._gpu import require_gpu
+
+            require_gpu()
+        self.device = device
         self._base = deepcopy(load_cider_model(base))
         if not isinstance(self._base, MappedXC2) or not supported(
             self._base, self._base.settings.nfeat
@@ -277,7 +285,11 @@ class FineTuner:
             record["e_tot_orig"]
             - record["exc_orig"]
             + integrate(
-                self._base, record, blocksize=self.blocksize, rhocut=self.rhocut
+                self._base,
+                record,
+                blocksize=self.blocksize,
+                rhocut=self.rhocut,
+                device=self.device,
             )
         )
 
@@ -311,7 +323,8 @@ class FineTuner:
         kernels = self._kernels()
         engine = MOLGP2(kernels, deepcopy(self._base.settings))
         engine.numerical_epsilon = self.jitter
-        # CPU deterministic fit/evaluation; no CUDA allocation is necessary here.
+        # Candidate selection and the dense solve retain their deterministic
+        # CPU implementations; explicit device quadratures dispatch separately.
         with policy(None):
             for kernel in kernels:
                 self._select_controls(
@@ -319,7 +332,12 @@ class FineTuner:
                 )
                 for key, record in {**records, **ueg_records}.items():
                     kernel.cov_dict[key] = covariance(
-                        kernel, record, self._base.settings, self.blocksize, self.rhocut
+                        kernel,
+                        record,
+                        self._base.settings,
+                        self.blocksize,
+                        self.rhocut,
+                        device=self.device,
                     )
                     kernel.base_dict[key] = 0.0
                     engine.ks_baseline_dict[key] = 0.0
@@ -433,6 +451,7 @@ class FineTuner:
                     core=False,
                     blocksize=self.blocksize,
                     rhocut=self.rhocut,
+                    device=self.device,
                 )
                 result[key] = {
                     "base": base / factor,
@@ -505,7 +524,7 @@ class FineTuner:
         return Path(path)
 
     @classmethod
-    def load(cls, path, *, constraints=None):
+    def load(cls, path, *, constraints=None, device="cpu"):
         """Reload inference state; supply protection records again before refit."""
         model = load_cider_model(path)
         meta = getattr(model, "ft_metadata", None)
@@ -531,6 +550,7 @@ class FineTuner:
         result = cls(
             base,
             constraints=constraints or Constraints(**meta["constraints"]),
+            device=device,
             **config,
         )
         result._model, result.fit_info = model, meta["fit_info"]
