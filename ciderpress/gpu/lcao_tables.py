@@ -1,35 +1,61 @@
-"""Owned molecular tables for the 9282196 version-j prototype.
+"""Owned molecular tables copied through libmcider's versioned snapshot API.
 
-Setup only: native Gaussian integrals/solves remain on the CPU. The private
-ctypes ABI is deliberately pinned to the exact header; never retain C views.
-This is not a replacement for a future native snapshot accessor.
+Setup only: native Gaussian integrals/solves remain on the CPU. No private C
+structure layout is mirrored here; all retained arrays own their storage.
 """
 import ctypes as ct
 from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path
 
 import numpy as np
 
-ABI_COMMIT = "9282196500a5e2635d4bf88555765cef55bc36fb"
-HEADER_SHA256 = "05d752a93e20ef595faebecaf8c5e40d551a735d51d9b4d64e4d5ba734022a80"
-_I = ct.POINTER(ct.c_int)
-_D = ct.POINTER(ct.c_double)
+
+def _accessor():
+    from ciderpress.dft.lcao_convolutions import libcider
+    try:
+        export = libcider.cider_export_atc_v1
+    except AttributeError as exc:
+        raise RuntimeError(
+            "libmcider lacks cider_export_atc_v1; rebuild CiderPress native "
+            "libraries from this checkout (python setup.py build_py, or a "
+            "clean CMake build of ciderpress/lib) before GPU LCAO setup"
+        ) from exc
+    export.argtypes = (ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_void_p,
+                       ct.c_size_t, ct.c_void_p, ct.c_size_t, ct.c_void_p, ct.c_size_t)
+    export.restype = ct.c_int
+    return export
 
 
-class _Collection(ct.Structure):
-    _fields_ = [(n, ct.c_int) for n in
-                ("natm", "tot_shl_pairs", "nalpha", "nbeta", "nfeat_i", "has_vj")]
-    _fields_ += [("icontrib_ids", _I), ("feat_orders", _I), ("max_pair", ct.c_int),
-                 ("atco_inp", ct.c_void_p), ("atco_out", ct.c_void_p),
-                 ("pair_loc", ct.POINTER(_I)), ("alphas", _D),
-                 ("alpha_norms", _D), ("ovlp_mats", _D)]
-
-
-def _owned(pointer, shape):
-    if not pointer:
-        raise RuntimeError("NULL pointer in pinned ATC ABI")
-    return np.array(np.ctypeslib.as_array(pointer, shape=shape), copy=True, order="C")
+def _snapshot(ccl):
+    export = _accessor()
+    meta = np.empty(9, dtype=np.uintp)
+    def call(rows=None, data=None):
+        rc = export(ccl._ccl, ccl.atco_inp._atco, ccl.atco_out._atco,
+                    ct.c_void_p(meta.ctypes.data), meta.size,
+                    None if rows is None else ct.c_void_p(rows.ctypes.data),
+                    0 if rows is None else rows.size,
+                    None if data is None else ct.c_void_p(data.ctypes.data),
+                    0 if data is None else data.size)
+        if rc:
+            raise RuntimeError(f"Native ATC snapshot failed (error {rc})")
+    call()
+    version, natm, na, nb, pairs, count, size, ni, no = map(int, meta)
+    if (version, natm, na, nb, ni, no) != (
+            1, ccl.atco_inp.natm, ccl.nalpha, ccl.nbeta,
+            ccl.atco_inp.nao, ccl.atco_out.nao):
+        raise RuntimeError("Native ATC snapshot dimension/version mismatch")
+    if pairs <= 0 or count <= 0 or size != pairs*na*nb + 2*na:
+        raise RuntimeError("Native ATC snapshot size mismatch")
+    expected = meta.copy()
+    rows = np.empty((count, 11), dtype=np.intc)
+    data = np.empty(size, dtype=np.float64)
+    call(rows, data)
+    if not np.array_equal(meta, expected):
+        raise RuntimeError("Native ATC snapshot changed during copy")
+    for value, ref in ((data[:na], ccl._alphas), (data[na:2*na], ccl._alpha_norms)):
+        if not np.array_equal(value, ref):
+            raise RuntimeError("Native ATC snapshot alpha mismatch")
+    return rows, data[2*na:], pairs
 
 
 def basis_groups(atco):
@@ -76,58 +102,47 @@ def extract_atc(ccl):
     no native 'solved' flag: the self-check proves the copied table implements
     the live operator; setup provenance must establish that the solve was run.
     """
-    header = Path(__file__).parents[1] / "lib/mod_cider/convolutions.h"
-    if sha256(header.read_bytes()).hexdigest() != HEADER_SHA256:
-        raise RuntimeError(f"Unknown convolution_collection ABI; expected {ABI_COMMIT}")
-    if ct.sizeof(ct.c_void_p) != 8 or ct.sizeof(_Collection) != 96:
-        raise RuntimeError("Pinned ATC ABI requires a 64-bit layout of size 96")
-    if not ccl._integrals_initialized or ccl.is_vk:
+    if not ccl._integrals_initialized or ccl.is_vk or ccl.nalpha != ccl.nbeta:
         raise ValueError("Need initialized version-j convolution tables")
-    c = ct.cast(ccl._ccl, ct.POINTER(_Collection)).contents
-    if (c.natm, c.nalpha, c.nbeta, c.nfeat_i, c.has_vj) != (
-            ccl.atco_inp.natm, ccl.nalpha, ccl.nbeta, 0, 1):
-        raise RuntimeError("ATC ABI dimension/feature mismatch")
-    if c.atco_inp != ct.cast(ccl.atco_inp._atco, ct.c_void_p).value or c.atco_out != ct.cast(ccl.atco_out._atco, ct.c_void_p).value:
-        raise RuntimeError("ATC ABI basis pointer mismatch")
-    for ptr, ref in ((c.alphas, ccl._alphas), (c.alpha_norms, ccl._alpha_norms)):
-        if not np.array_equal(_owned(ptr, ref.shape), ref):
-            raise RuntimeError("ATC ABI alpha mismatch")
+    rows, data, pairs = _snapshot(ccl)
     ing, outg = basis_groups(ccl.atco_inp), basis_groups(ccl.atco_out)
     if [(g[0], g[1]) for g in ing] != [(g[0], g[1]) for g in outg]:
         raise ValueError("Input/output atom/l blocks must match")
-    pairs = sum((i[3]-i[2])*(o[3]-o[2]) for i, o in zip(ing, outg))
-    if pairs != c.tot_shl_pairs or pairs <= 0:
-        raise RuntimeError("ATC ABI shell-pair mismatch")
+    if len(rows) != len(ing):
+        raise RuntimeError("Native ATC snapshot block count mismatch")
     blocks, expected = [], 0
-    for i, o in zip(ing, outg):
+    for row, i, o in zip(rows, ing, outg):
         a, l = i[:2]
         n, m = i[3]-i[2], o[3]-o[2]
-        if c.pair_loc[a][l] != expected:
-            raise RuntimeError("ATC ABI pair offset mismatch")
-        count = n*m*c.nalpha*c.nbeta
-        ptr = ct.cast(ct.addressof(c.ovlp_mats.contents) + expected*c.nalpha*c.nbeta*8, _D)
-        raw = _owned(ptr, (count,)).reshape(m, n, c.nbeta, c.nalpha)
-        matrix = np.ascontiguousarray(raw.transpose(0, 2, 1, 3).reshape(m*c.nbeta, n*c.nalpha))
+        if tuple(row) != (*i, *o[2:], expected):
+            raise RuntimeError("Native ATC snapshot block index mismatch")
+        count = n*m*ccl.nalpha*ccl.nbeta
+        offset = expected*ccl.nalpha*ccl.nbeta
+        raw = data[offset:offset+count].reshape(m, n, ccl.nbeta, ccl.nalpha)
+        matrix = np.array(raw.transpose(0, 2, 1, 3).reshape(m*ccl.nbeta, n*ccl.nalpha),
+                          copy=True, order="C")
         if not np.isfinite(matrix).all():
             raise RuntimeError("Non-finite solved ATC table")
         matrix.flags.writeable = False
         blocks.append(ATCBlock(a, l, slice(i[4], i[5]), slice(o[4], o[5]), matrix))
         expected += n*m
+    if expected != pairs:
+        raise RuntimeError("Native ATC snapshot shell-pair mismatch")
     rng, checks = np.random.default_rng(9282196), {}
     for forward in (True, False):
         src = ccl.atco_inp if forward else ccl.atco_out
         dst = ccl.atco_out if forward else ccl.atco_inp
-        x = rng.normal(size=(src.nao, c.nalpha))
+        x = rng.normal(size=(src.nao, ccl.nalpha))
         ref = ccl.multiply_atc_integrals(x, fwd=forward)
-        value = apply_atc_numpy(blocks, x, dst.nao, c.nalpha, forward)
+        value = apply_atc_numpy(blocks, x, dst.nao, ccl.nalpha, forward)
         scale = max(1., float(np.max(np.abs(ref))))
         err = np.abs(value-ref)
         passed = bool(np.all(err <= 1e-12*scale + 1e-12*np.abs(ref)))
         checks["forward" if forward else "adjoint"] = dict(max_abs=float(err.max()), scale=scale, passed=passed)
         if not passed:
-            raise RuntimeError(f"Pinned ATC native self-check failed: {checks}")
-    return tuple(blocks), dict(commit=ABI_COMMIT, header_sha256=HEADER_SHA256,
-                               struct_size=ct.sizeof(_Collection), shell_pairs=pairs, checks=checks)
+            raise RuntimeError(f"ATC native self-check failed: {checks}")
+    return tuple(blocks), dict(accessor="cider_export_atc_v1", abi_version=1,
+                               shell_pairs=pairs, checks=checks)
 
 
 def radial_tables(atco, indexer):
