@@ -71,3 +71,54 @@ acceptability. It supplies the official `ft.from_pyscf(feature_generator=)`
 contract, with explicit transfers only at export. E1 remains the official
 CPU feature generator and writer. See the bench `docs/results/pyg-scf.md`
 for measured gates, differences, memory, costs and open issues.
+
+## E0 molecular FT records
+
+The default molecular FT export uses the GPU SCF features and the official
+FT adapter/writer. Explicit state qualification is required before export:
+
+```python
+from ciderpress.gpu4pyscf.export import from_gpu_scf, write_e0_records
+
+record = from_gpu_scf(
+    mf,
+    state={"id": "water_l4", "accepted": True, "resolved": True,
+           "cpu_adopted": False},
+    source_geometry={"database": "GMTKN55", "subset": "W4-11",
+                     "system": "h2o", "files": {"coord": {"sha256": coord_sha}}},
+    provenance={"ciderpress": {"commit": ciderpress_commit},
+                "bench": {"commit": bench_commit}},
+)
+directories = write_e0_records({"water_l4": record}, "training")
+```
+
+For UKS, state qualification must include
+`"qualification": {"open_shell_accepted": True, ...}` with the evidence for
+state selection, CPU/GPU cross-start and perturbation checks. This is a caller
+attestation; the exporter does not perform a stability search. CPU-adopted
+states must be flagged explicitly. An unconverged or unresolved state raises.
+
+The CPU shell freezes the final untagged DM, MO arrays, coordinates and signed
+weights, and forbids CPU energy/J/XC/SCF recomputation. Optional `saved_state=`
+checks all these arrays and both energies against the live calculation. The
+record retains raw SL(3)+NLDF(3), five spin-scaled density components, atomic
+numbers and feature settings; `exc_core=0` and pointwise `val` is absent.
+Provenance includes source pins, model digest, grid functions and array hashes,
+stage-1 reduction/schedule, J/DF/resolved auxiliary basis, versions and device.
+The writer delegates HDF5 layout entirely to `ft.write_records` and adds
+`manifests/<id>.json` containing hashes, sizes and provenance. Reaction labels
+are supplied separately through `ReactionSet.add_reaction`.
+
+For ECP atoms the adapter repairs a metadata issue in the current official
+FT entry: PySCF `mol.atom_charges()` contains effective integral charges
+(iodine: 25), whereas record `numbers` must contain physical atomic numbers
+(iodine: 53). `molecular_composition` derives those from the element symbols,
+records both charge arrays and the ECP core-electron count, and corrects only
+the returned record metadata. No molecular integrals or FT source are changed.
+Apply `molecular_composition(shell.mol)["numbers"]` to standalone E1 records
+from the unwrapped FT adapter as well; the benchmark harness does this explicitly.
+
+E1 qualification can use `cpu_shell_from_gpu(mf)` and the official
+`from_pyscf(shell, grids=shell.grids, feature_generator=...)`; the NLDF CPU
+call must explicitly set `inner_grids=shell.grids` to retain level 4 on both
+inner and outer grids. E0 does not implement a GPU train_gen interpolator.
