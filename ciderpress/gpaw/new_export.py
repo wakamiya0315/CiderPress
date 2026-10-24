@@ -7,8 +7,10 @@ is the lower-level API for identical-input tests: ``xc`` is a contextualized
 ``CiderNewMGGAFunctional``; n/tau are its fine-grid UGArrays, including pseudo
 cores, and density supplies the PAW matrices. Arrays returned are host FP64.
 The NLDF/PASDW forward uses the functional's device. The feature-only PAW
-quadrature is a host routine: its private forward caches are explicitly
-transferred to NumPy before quadrature (the live SCF caches are untouched).
+quadrature runs on the host by default. ``gpu=True`` opts into FP64 device
+quadrature on a CUDA functional, reusing New's density, projection, spherical
+and spline kernels. Private forward caches stay on device; live SCF caches
+are untouched. Returned arrays and the HDF5 schema are unchanged.
 Joint-tau GPW restart clears GPAW's ASE energy cache. For a checkpoint whose
 convergence has been independently qualified, the caller can expose its saved
 energies with ``calc.dft.calculate_energy()`` before export; this performs no
@@ -29,6 +31,9 @@ False so the full XC integral can be checked without a vacuum truncation.
 with the model and external X/C baselines, then adds ``exc_core`` (minus the
 PAW setup reference core XC energies). This constant is essential to compare
 with the calculator's XC; it is not part of the Classic descriptor arrays.
+``integrate_xc(..., gpu=True)`` also selects the existing FP64 mapped-XC
+device evaluator. Normalization, external LibXC baselines and the final
+signed-weight reduction keep their host interfaces. The default is unchanged.
 ``e_tot_orig`` and ``exc_orig`` are calculator energies in Hartree; the former
 is the zero-temperature extrapolated energy (``e_free_orig`` is also saved).
 ``exc_replayed`` is a fresh XC evaluation on the exported n/tau/D state, to
@@ -77,12 +82,15 @@ class _ExportEngine(_Engine):
         self.atom_slices_s = None
 
 
-def export_features(functional, nt_sr, taut_sr, density, *, screen_dens=False):
+def export_features(functional, nt_sr, taut_sr, density, *, screen_dens=False,
+                    gpu=False):
     """Export a supplied n/tau/D state without touching the live engine."""
     if not isinstance(functional, CiderNewMGGAFunctional):
         raise TypeError('Expected New-GPAW CIDER functional')
     if functional.setups is None:
         raise ValueError('CIDER functional needs PAW context')
+    if gpu and functional._device is None:
+        raise ValueError('gpu=True export requires a CUDA functional')
     with policy(functional._device):
         # Construction and dispatch both use the calculation's CUDA device,
         # even if the caller selected another device after the SCF.
@@ -114,20 +122,22 @@ def export_features(functional, nt_sr, taut_sr, density, *, screen_dens=False):
         nspin = len(rho)
         nldf = engine.call_fwd(
             engine._plan.get_rho_tuple(rho, with_spin=True))[0] * nspin
-        # GPU PASDW retains fr/df/coefficient arrays on device. Classic's
-        # feature-only PAW quadrature performs NumPy dot products and cannot
-        # consume those arrays implicitly. Transfer only this private engine's
-        # caches, after the GPU grid forward has completed.
-        from gpaw.gpu import as_np
+        # Classic's feature quadrature needs NumPy caches. The opt-in path
+        # consumes the private forward caches on device instead.
         paw = engine.paw_kernel
-        paw.fr_asgLq = {a: as_np(x) for a, x in paw.fr_asgLq.items()}
-        paw.df_asgLq = {a: as_np(x) for a, x in paw.df_asgLq.items()}
-        coefficients = {a: as_np(x) for a, x in engine.c_asiq.items()}
-        with policy(None):
-            ae_nl, ps_nl = paw.calculate_paw_cider_features_p2(
-                engine.setups, engine.D_asp, coefficients, None, None)
-            ae_rho, ps_rho = calculate_paw_sl_features(
-                engine.setups, engine.D_asp, True)
+        if gpu:
+            from ciderpress.gpaw._export_gpu import paw_features
+            ae_nl, ps_nl, ae_rho, ps_rho = paw_features(engine)
+        else:
+            from gpaw.gpu import as_np
+            paw.fr_asgLq = {a: as_np(x) for a, x in paw.fr_asgLq.items()}
+            paw.df_asgLq = {a: as_np(x) for a, x in paw.df_asgLq.items()}
+            coefficients = {a: as_np(x) for a, x in engine.c_asiq.items()}
+            with policy(None):
+                ae_nl, ps_nl = paw.calculate_paw_cider_features_p2(
+                    engine.setups, engine.D_asp, coefficients, None, None)
+                ae_rho, ps_rho = calculate_paw_sl_features(
+                    engine.setups, engine.D_asp, True)
         plan = SemilocalPlan(functional.param.mlfunc.settings.sl_settings, nspin)
         mask = (n.sum(axis=0).ravel() > 1e-6 if screen_dens else
                 np.ones(n[0].size, dtype=bool))
@@ -154,7 +164,7 @@ def export_features(functional, nt_sr, taut_sr, density, *, screen_dens=False):
                     model_sha256=functional.param.model_sha256)
 
 
-def export_training_data(calc, *, screen_dens=False):
+def export_training_data(calc, *, screen_dens=False, gpu=False):
     """Export a converged calculator; refuse an uninitialized/unfinished state."""
     if getattr(calc, '_dft', None) is None or 'energy' not in calc.dft.results:
         raise ValueError('Export requires a converged New-GPAW calculator')
@@ -167,7 +177,7 @@ def export_training_data(calc, *, screen_dens=False):
         n = pc._interpolate_density(dft.density.nt_sR)[0]
         tau = pc.interpolate(dft.density.taut_sR)
         record = export_features(pc.xc, n, tau, dft.density,
-                                 screen_dens=screen_dens)
+                                 screen_dens=screen_dens, gpu=gpu)
         record.update(e_tot_orig=float(dft.energies.total_extrapolated),
                       e_free_orig=float(dft.energies.total_free),
                       exc_orig=float(dft.energies._energies['xc']))
@@ -181,7 +191,7 @@ def export_training_data(calc, *, screen_dens=False):
     return record
 
 
-def xc_energy_density(record, param, *, blocksize=10000):
+def xc_energy_density(record, param, *, blocksize=10000, gpu=False):
     """Evaluate saved SL+NLDF and physical raw ingredients, in Ha/Bohr**3."""
     from ciderpress.dft.xc_evaluator import MappedXC
     from gpaw.xc.libxc import LibXC
@@ -194,6 +204,19 @@ def xc_energy_density(record, param, *, blocksize=10000):
     if digest != param.model_sha256:
         raise ValueError('Record/model SHA256 mismatch')
     model = param.mlfunc
+    if gpu:
+        from ciderpress.gpu import _real_cupy, use_gpu
+        from ciderpress.gpu.semilocal import supported
+
+        cp = _real_cupy()
+        if cp is None:
+            raise RuntimeError('GPU XC replay requires CuPy with a CUDA device')
+        if not supported(model, record['desc'].shape[1]):
+            raise NotImplementedError('GPU XC replay requires a supported mapped-XC model')
+        with policy(cp.cuda.Device().id):
+            if not all(use_gpu(k) for k in ('semilocal', 'rbf', 'libxc')):
+                raise ValueError('GPU XC replay requires semilocal, rbf and libxc kernels')
+            return xc_energy_density(record, param, blocksize=blocksize)
     energy = np.empty(record['wt'].size)
     for start in range(0, energy.size, blocksize):
         stop = start + blocksize
@@ -222,10 +245,10 @@ def xc_energy_density(record, param, *, blocksize=10000):
     return energy
 
 
-def integrate_xc(record, param, *, blocksize=10000):
+def integrate_xc(record, param, *, blocksize=10000, gpu=False):
     """Total XC in Ha, including the setup reference-core subtraction."""
     return float(np.dot(record['wt'], xc_energy_density(
-        record, param, blocksize=blocksize)) + record['exc_core'])
+        record, param, blocksize=blocksize, gpu=gpu)) + record['exc_core'])
 
 
 def write_training_data(record, directory, system_id, *, reference_energy=None,
