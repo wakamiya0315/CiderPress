@@ -441,7 +441,7 @@ class _CiderBase:
     def _get_taut(self, n_sg):
         if self.type == "MGGA":
             if self.fixed_ke:
-                taut_sG = self._fixed_taut_sG
+                taut_sG = self._fixed_taut_sG.copy()
                 if not self._taut_gradv_init:
                     self._taut_gradv_init = True
                     # ensure initialization for calculating potential
