@@ -1,6 +1,5 @@
-"""Pinned native ABI and owned table checks, independently of CUDA."""
+"""Versioned native snapshot and owned table checks, independently of CUDA."""
 import ctypes
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -18,11 +17,27 @@ def native_generator(monkeypatch):
     return mf._numint.nldfgen
 
 
-def test_pinned_owned_atc(native_generator):
-    from ciderpress.gpu.lcao_tables import extract_atc,apply_atc_numpy,_Collection
+def test_snapshot_owned_atc(native_generator):
+    from ciderpress.gpu.lcao_tables import extract_atc,apply_atc_numpy,_snapshot,basis_groups
     ccl=native_generator.ccl
     blocks,check=extract_atc(ccl)
-    assert ctypes.sizeof(_Collection)==96
+    rows,raw,pairs=_snapshot(ccl)
+    assert check["accessor"]=="cider_export_atc_v1" and check["abi_version"]==1
+    assert rows.shape==(len(blocks),11) and rows.dtype==np.dtype(np.intc)
+    assert raw.shape==(pairs*ccl.nalpha*ccl.nbeta,) and raw.dtype==np.dtype(np.float64)
+    assert check["shell_pairs"]==pairs
+    offset=0
+    for b,row,i,o in zip(blocks,rows,basis_groups(ccl.atco_inp),basis_groups(ccl.atco_out)):
+        assert tuple(row)==(*i,*o[2:],offset)
+        ni,no=i[3]-i[2],o[3]-o[2]
+        count=ni*no*ccl.nalpha*ccl.nbeta
+        start=offset*ccl.nalpha*ccl.nbeta
+        expected=raw[start:start+count].reshape(no,ni,ccl.nbeta,ccl.nalpha)
+        expected=expected.transpose(0,2,1,3).reshape(no*ccl.nbeta,ni*ccl.nalpha)
+        assert b.matrix.tobytes()==expected.tobytes()
+        offset+=ni*no
+    assert offset==pairs
+    assert set(check["checks"])=={"forward","adjoint"}
     assert all(v["passed"] for v in check["checks"].values())
     assert all(not b.matrix.flags.writeable for b in blocks)
     x=np.random.default_rng(4).normal(size=(ccl.atco_inp.nao,ccl.nalpha))
@@ -31,10 +46,16 @@ def test_pinned_owned_atc(native_generator):
     np.testing.assert_allclose(value,ref,rtol=1e-12,atol=1e-12*max(1,abs(ref).max()))
 
 
-def test_abi_refuses_unknown_header(native_generator,monkeypatch):
+def test_snapshot_refuses_unknown_abi(native_generator,monkeypatch):
     from ciderpress.gpu import lcao_tables
-    monkeypatch.setattr(lcao_tables,"HEADER_SHA256","unknown")
-    with pytest.raises(RuntimeError,match="Unknown.*ABI"):
+    export=lcao_tables._accessor()
+    def unknown_version(*args):
+        rc=export(*args)
+        if rc==0:
+            ctypes.cast(args[3],ctypes.POINTER(ctypes.c_size_t))[0]=999
+        return rc
+    monkeypatch.setattr(lcao_tables,"_accessor",lambda:unknown_version)
+    with pytest.raises(RuntimeError,match="snapshot dimension/version mismatch"):
         lcao_tables.extract_atc(native_generator.ccl)
 
 

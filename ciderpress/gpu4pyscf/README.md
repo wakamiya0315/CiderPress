@@ -41,7 +41,14 @@ No CPU CIDER evaluation occurs in SCF. `make_pbe_calc` shares immutable
 matrices and J data with the CIDER calculator; run the two sequentially.
 
 CPU native libxc consumers are loaded and checked before gpu4pyscf. The
-authoritative CiderGrids use alignment 1, no sorting or density pruning.
+package uses lazy imports: `import ciderpress`, `import ciderpress.gpu`, and
+`import ciderpress.gpu4pyscf` succeed without gpu4pyscf. Calling
+`make_cider_calc_gpu` first loads and checks CPU libxc consumers, then loads
+gpu4pyscf; if it is absent, the factory raises an `ImportError` naming the
+required gpu4pyscf 1.9.0. Import this entry point and call the factory before
+importing gpu4pyscf directly, so that CPU libxc binds first.
+
+The authoritative CiderGrids use alignment 1, no sorting or density pruning.
 The pure-MGGA `R2SCAN` string is only gpu4pyscf's dispatch facade; the bound
 full-grid NumInt evaluates GPU CIDER, never r2SCAN or CPU XC. Default
 convergence is energy 1e-9 Ha / gradient 1e-6. Reconstruct the calculator

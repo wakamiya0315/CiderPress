@@ -51,30 +51,23 @@ def test_odd_q_offsets_additive_and_empty_bins(device,atom,spin):
         with gpu.policy(None):basis.convert_rad2orb_(rref,expected,g,g.rad_arr,rad2orb=False,offset=offset,zero_output=False)
         close(cp,t.radial_transform(cp.asarray(expected),label,forward=False,out=cp.asarray(rinitial),offset=offset,zero_output=False),rref)
     # Exercise the ATC alpha strides with an odd Q and nonzero initial C.
-    # Clone the pinned collection into owned test memory; the live generator
-    # and its solved tables remain untouched. The native multiply consumes
-    # exactly the cropped table used by the GPU.
+    # Build the native reference through the public collection API, without
+    # mirroring or altering its private C layout or the live generator.
     import copy
-    import ctypes as ct
-    from ciderpress.gpu.lcao_tables import _Collection,extract_atc
-    from ciderpress.dft.lcao_convolutions import libcider
-    blocks,_=extract_atc(gen.ccl)
-    odd=copy.copy(t);odd.q=q;odd.atc=[];raw=[]
+    from ciderpress.gpu.lcao_tables import extract_atc
+    from ciderpress.dft.lcao_convolutions import ConvolutionCollection
+    native=ConvolutionCollection(gen.ccl.atco_inp,gen.ccl.atco_out,
+        gen.ccl._alphas[:q],gen.ccl._alpha_norms[:q],has_vj=True)
+    native.solve_projection_coefficients()
+    assert native.nalpha==native.nbeta==q
+    blocks,_=extract_atc(native)
+    odd=copy.copy(t);odd.q=q;odd.atc=[]
     for b in blocks:
-        nm=2*b.l+1
-        ni=(b.input_slice.stop-b.input_slice.start)//nm
-        no=(b.output_slice.stop-b.output_slice.start)//nm
-        cropped=b.matrix.reshape(no,t.q,ni,t.q)[:,:q,:,:q]
-        odd.atc.append((b.l,b.input_slice,b.output_slice,cp.asarray(np.ascontiguousarray(cropped.reshape(no*q,ni*q)))))
-        raw.append(np.ascontiguousarray(cropped.transpose(0,2,1,3)).ravel())
-    raw=np.concatenate(raw)
-    native=_Collection.from_buffer_copy(ct.string_at(gen.ccl._ccl,ct.sizeof(_Collection)))
-    native.nalpha=native.nbeta=q
-    native.ovlp_mats=raw.ctypes.data_as(ct.POINTER(ct.c_double))
+        odd.atc.append((b.l,b.input_slice,b.output_slice,cp.asarray(b.matrix)))
     for forward in (True,False):
         src,dst=(gen.ccl.atco_inp,gen.ccl.atco_out) if forward else (gen.ccl.atco_out,gen.ccl.atco_inp)
         inp=rng.normal(size=(src.nao,q));initial=rng.normal(size=(dst.nao,q));ref=initial.copy()
-        libcider.multiply_atc_integrals(inp.ctypes.data_as(ct.c_void_p),ref.ctypes.data_as(ct.c_void_p),ct.byref(native),ct.c_int(forward))
+        native.multiply_atc_integrals(inp,output=ref,fwd=forward)
         close(cp,odd.atc_transform(cp.asarray(inp),forward=forward,out=cp.asarray(initial)),ref)
     inp=rng.normal(size=(gen.ccl.atco_out.nao,q))
     native_it=copy.copy(gen.interpolator);native_it._n0=q

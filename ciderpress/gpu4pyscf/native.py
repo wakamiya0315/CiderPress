@@ -32,6 +32,14 @@ def preload_cpu():
 
 
 def require_version():
-    import gpu4pyscf
+    try:
+        import gpu4pyscf
+    except ModuleNotFoundError as exc:
+        if exc.name != "gpu4pyscf":
+            raise
+        raise ImportError(
+            "CIDER GPU SCF requires gpu4pyscf 1.9.0; install that optional "
+            "dependency in a CUDA environment before calling make_cider_calc_gpu"
+        ) from exc
     if gpu4pyscf.__version__ != "1.9.0":
         raise NotImplementedError("CIDER bridge and DF-J adapter require gpu4pyscf exactly 1.9.0")
