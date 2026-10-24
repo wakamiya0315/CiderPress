@@ -11,6 +11,13 @@ quadrature runs on the host by default. ``gpu=True`` opts into FP64 device
 quadrature on a CUDA functional, reusing New's density, projection, spherical
 and spline kernels. Private forward caches stay on device; live SCF caches
 are untouched. Returned arrays and the HDF5 schema are unchanged.
+The bounded process-local ``DEFAULT_PAW_CACHE`` reuses density-independent
+host setup tables across both private engines and consecutive exports. Pass
+``paw_cache=ExportPAWCache(maxsize=16)`` for an explicit owner, or
+``paw_cache=None`` for the original rebuild path. ``cache.clear()`` releases
+its entries and resets ``cache.info()`` counters. Each engine has fresh plans,
+contributions, lazy device mirrors and geometry/density scratch. Live SCF
+tables are never borrowed. Clearing does not invalidate an export in progress.
 Joint-tau GPW restart clears GPAW's ASE energy cache. For a checkpoint whose
 convergence has been independently qualified, the caller can expose its saved
 energies with ``calc.dft.calculate_energy()`` before export; this performs no
@@ -66,10 +73,42 @@ from ciderpress.gpaw.atom_descriptor_utils import (
 from ciderpress.gpaw.descriptors import get_atom_wt
 from ciderpress.gpaw.config import GPAW_DEFAULT_RHO_TOL
 from ciderpress.gpaw.new_backend import CiderNewMGGAFunctional, _Engine
+from ciderpress.gpaw._export_paw_cache import DEFAULT_PAW_CACHE, ExportPAWCache
 from ciderpress.gpu import policy
 
 
-class _ExportEngine(_Engine):
+class _CachedPAWEngine(_Engine):
+    def _initialize_export_paw(self):
+        if self.export_paw_cache is None:
+            self.paw_kernel.initialize_more_things(self.setups)
+        else:
+            self.export_paw_cache.initialize(self.paw_kernel, self.export_paw_signature)
+
+    def initialize_paw_kernel(self, kernel, nalpha, encut):
+        from ciderpress.gpaw.atom_utils import FastPASDWCiderKernel
+        self.paw_kernel = FastPASDWCiderKernel(
+            kernel, self._plan, self.aux_gd, self.cut_xcgrid)
+        self.paw_kernel.initialize(
+            self.dens, self.atomdist, self.atom_partition, self.setups)
+        self._initialize_export_paw()
+        self.paw_kernel.interpolate_dn1 = self.interpolate_dn1
+        self.atom_slices_s = None
+
+
+def _private_engine(private, cls, cache):
+    if cache is not None and not isinstance(cache, ExportPAWCache):
+        raise TypeError('paw_cache must be an ExportPAWCache or None')
+    engine = cls(private.param, private.grid, private.grad_v)
+    engine.export_paw_cache = cache
+    engine.export_paw_signature = (
+        private.param.model_sha256, private.param.options, private.param.nldf,
+        private.xp.__name__, private._device, np.dtype(np.float64).str,
+        engine.interpolate_dn1, engine.encut_atom_min,
+        engine.pasdw_ovlp_fit, engine.pasdw_store_funcs)
+    return engine
+
+
+class _ExportEngine(_CachedPAWEngine):
     """Forward-only New engine with Classic's PAW feature quadrature."""
 
     def initialize_paw_kernel(self, kernel, nalpha, encut):
@@ -77,14 +116,14 @@ class _ExportEngine(_Engine):
             kernel, self._plan, self.aux_gd, self.cut_xcgrid)
         self.paw_kernel.initialize(
             self.dens, self.atomdist, self.atom_partition, self.setups)
-        self.paw_kernel.initialize_more_things(self.setups)
+        self._initialize_export_paw()
         self.paw_kernel.interpolate_dn1 = self.interpolate_dn1
         self.atom_slices_s = None
 
 
 def export_features(functional, nt_sr, taut_sr, density, *, screen_dens=False,
-                    gpu=False):
-    """Export a supplied n/tau/D state without touching the live engine."""
+                    gpu=False, paw_cache=DEFAULT_PAW_CACHE):
+    """Export n/tau/D; paw_cache=None disables process-local PAW table reuse."""
     if not isinstance(functional, CiderNewMGGAFunctional):
         raise TypeError('Expected New-GPAW CIDER functional')
     if functional.setups is None:
@@ -97,8 +136,7 @@ def export_features(functional, nt_sr, taut_sr, density, *, screen_dens=False,
         # Context creation clones Setup objects before PASDW attaches scratch.
         private = CiderNewMGGAFunctional(functional.param, functional.grid,
                                        functional.xp)
-        private.engine = _ExportEngine(functional.param, functional.grid,
-                                       private.grad_v)
+        private.engine = _private_engine(private, _ExportEngine, paw_cache)
         private.set_context(setups=functional.setups,
                             relpos_ac=functional._relpos,
                             atomdist=density.D_asii.layout.atomdist)
@@ -164,8 +202,14 @@ def export_features(functional, nt_sr, taut_sr, density, *, screen_dens=False,
                     model_sha256=functional.param.model_sha256)
 
 
-def export_training_data(calc, *, screen_dens=False, gpu=False):
-    """Export a converged calculator; refuse an uninitialized/unfinished state."""
+def export_training_data(calc, *, screen_dens=False, gpu=False,
+                         paw_cache=DEFAULT_PAW_CACHE):
+    """Export a converged calculator, optionally reusing private PAW tables.
+
+    ``paw_cache`` defaults to DEFAULT_PAW_CACHE; pass None to disable it or
+    supply an ExportPAWCache whose lifetime/clear operation the caller owns.
+    Uninitialized/unfinished calculator states are refused.
+    """
     if getattr(calc, '_dft', None) is None or 'energy' not in calc.dft.results:
         raise ValueError('Export requires a converged New-GPAW calculator')
     dft = calc.dft
@@ -177,12 +221,14 @@ def export_training_data(calc, *, screen_dens=False, gpu=False):
         n = pc._interpolate_density(dft.density.nt_sR)[0]
         tau = pc.interpolate(dft.density.taut_sR)
         record = export_features(pc.xc, n, tau, dft.density,
-                                 screen_dens=screen_dens, gpu=gpu)
+                                 screen_dens=screen_dens, gpu=gpu,
+                                 paw_cache=paw_cache)
         record.update(e_tot_orig=float(dft.energies.total_extrapolated),
                       e_free_orig=float(dft.energies.total_free),
                       exc_orig=float(dft.energies._energies['xc']))
         # Replaying a private functional avoids invalidating live force/PAW caches.
         replay = CiderNewMGGAFunctional(pc.xc.param, pc.fine_grid, pc.xp)
+        replay.engine = _private_engine(replay, _CachedPAWEngine, paw_cache)
         replay.set_context(setups=pc.setups, relpos_ac=pc.relpos_ac,
                            atomdist=pc.atomdist, communicators=pc.communicators)
         replay.set_density(dft.density)
