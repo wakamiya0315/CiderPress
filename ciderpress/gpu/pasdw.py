@@ -2,7 +2,7 @@
 
 All radial tables are evaluated by the original C/libm expressions on the
 host. Reductions preserve the C loop order (CUDA FMA contraction is disabled);
-the fixed radial pair explicitly uses FMA residuals for compensated sums.
+the fixed radial and density pairs use FMA residuals for compensated sums.
 The ill-conditioned PAW basis fits and all Cholesky solves remain on the CPU.
 """
 
@@ -68,6 +68,20 @@ extern "C" __global__ void fixed_adjoint(
         radial_add(ph, pl, hi, lo);
     }
     out[((s*nk+k)*nlm+l*l+m)*nq+q] = scalbn(hi+lo, exponent[k]);
+}
+extern "C" __global__ void density_projection(
+    const double* a, const double* b, double* out,
+    long long rows, long long inner, long long cols) {
+    long long t = (long long)blockDim.x*blockIdx.x + threadIdx.x;
+    if (t >= rows*cols) return;
+    long long row = t/cols, col = t%cols;
+    double hi = 0.0, lo = 0.0;
+    for (long long k = 0; k < inner; k++) {
+        double x = a[row*inner+k], y = b[k*cols+col];
+        double ph = x*y, pl = fma(x, y, -ph);
+        radial_add(ph, pl, hi, lo);
+    }
+    out[t] = hi+lo;
 }
 extern "C" __global__ void rad2orb(
     const double* x, const double* table, const int* shell, const int* lm,
@@ -248,6 +262,30 @@ def _launch(name, size, args):
 def _device_array(x):
     cp = cupy()
     return cp.ascontiguousarray(x) if isinstance(x, cp.ndarray) else cp.asarray(np.ascontiguousarray(x))
+
+
+def density_projection(values, table):
+    """Paired D B / v B.T density maps with compensated FP64 dots.
+
+    Each independent output follows the contracted index in ascending order.
+    Retain product and summation residuals until the final FP64 store: small
+    density-coefficient errors otherwise grow in the unchanged CPU PAW fit.
+    The forward and transpose callers share this device reduction. No fit,
+    quadrature table or density-dependent threshold is changed.
+    """
+    cp = cupy()
+    if (values.ndim < 2 or table.ndim != 2 or values.shape[-1] != table.shape[0]
+            or values.dtype != np.float64 or table.dtype != np.float64):
+        raise ValueError('PASDW density projection needs matching real float64 arrays')
+    rows, inner, cols = prod(values.shape[:-1]), values.shape[-1], table.shape[1]
+    _checked_size(rows, inner)
+    _checked_size(inner, cols)
+    _checked_size(rows, cols)
+    out = cp.empty((*values.shape[:-1], cols), dtype=cp.float64)
+    _launch('density_projection', out.size,
+            (_device_array(values), _device_array(table), out,
+             np.int64(rows), np.int64(inner), np.int64(cols)))
+    return out
 
 
 def _join_device(values, stack=True):
