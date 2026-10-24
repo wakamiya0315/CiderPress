@@ -277,3 +277,12 @@ print("GPAW-free PySCF export, write and both readers passed")
         capture_output=True, text=True, env=os.environ.copy(), timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_physical_atomic_numbers_with_ecp():
+    from ciderpress.ft.records import physical_atomic_numbers
+
+    mol = gto.M(atom="I 0 0 0; H 0 0 1.61", basis="def2-svp", ecp="def2-svp",
+                verbose=0)
+    assert list(mol.atom_charges()) == [25, 1]
+    assert list(physical_atomic_numbers(mol)) == [53, 1]

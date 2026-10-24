@@ -102,6 +102,22 @@ def covariance(kernel, record, settings, blocksize, rhocut):
     return result
 
 
+def physical_atomic_numbers(mol):
+    """Atomic numbers from element symbols.
+
+    PySCF ``atom_charges()`` returns effective nuclear charges for ECP atoms
+    (I: 25 with a def2 ECP), which would break composition checks.
+    """
+    from pyscf import gto
+
+    numbers = np.array(
+        [gto.charge(mol.atom_pure_symbol(i)) for i in range(mol.natm)], dtype=int
+    )
+    if numbers.size == 0 or np.any(numbers <= 0):
+        raise ValueError("physical atomic numbers are required; ghost atoms unsupported")
+    return numbers
+
+
 def _same_grid(left, right):
     return all(
         getattr(left, key, None) is not None
@@ -239,7 +255,7 @@ def from_pyscf(
         "e_tot_orig": e_tot,
         "exc_orig": exc,
         "energy_unit": "Hartree",
-        "numbers": calc.mol.atom_charges(),
+        "numbers": physical_atomic_numbers(calc.mol),
         "feature_settings_yaml": yaml.dump(settings),
     }
     if provenance is not None:
