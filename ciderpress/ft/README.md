@@ -187,6 +187,26 @@ dense pivoted Cholesky then selects at most `n_control` points per component.
 This is a selection from that bounded pool, not a pivot over every grid point.
 Dense pool memory grows quadratically; raise the cap deliberately.
 
+Optional `candidate_groups={record_id: group_name}` and
+`group_fractions={group_name: fraction}` stratify that pool. Supply both;
+positive fractions must sum to one and every training/protection ID must be
+mapped. IDs are the original `ReactionSet` IDs, including those supplied in
+`constraints.molecules`. Each group receives `floor(max_candidates * fraction)`
+candidate rows, with an equal candidate-row budget of `group_limit // record_count`
+per record. The grid budget divides that by the number of descriptor rows
+per point (one or two, depending on kernel and spin). Zero budgets skip that
+group; unused capacity is not redistributed. UEG records are appended
+separately with their legacy per-record sampling budget, so their rows are
+additional to `max_candidates` in grouped mode. Sampling remains deterministic
+linspace and the kernel's pivoted Cholesky is unchanged on both devices.
+Omitting both options preserves the legacy arithmetic exactly.
+
+The configuration, realized record budgets and selected control origins are
+saved in `fit_info` and model YAML metadata. Identical descriptors can have
+multiple origins: attribution uses the first pool occurrence and records the
+alternative `possible_groups` explicitly. Group fractions constrain candidate
+capacity, not the fractions surviving Cholesky reduction.
+
 `Constraints` defaults, in eV:
 
 | Setting | Default | Meaning |

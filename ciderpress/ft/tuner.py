@@ -115,6 +115,8 @@ class FineTuner:
         components="x",
         prior_scale=0.1,
         max_candidates=1500,
+        candidate_groups=None,
+        group_fractions=None,
         blocksize=4000,
         rhocut=1e-8,
         jitter=1e-12,
@@ -158,6 +160,20 @@ class FineTuner:
             raise ValueError("max_candidates must be at least n_control")
         self.n_control, self.components = n_control, components
         self.prior_scale, self.max_candidates = prior_scale, max_candidates
+        if (candidate_groups is None) != (group_fractions is None):
+            raise ValueError("candidate_groups and group_fractions must be supplied together")
+        self.candidate_groups = None if candidate_groups is None else dict(candidate_groups)
+        self.group_fractions = None if group_fractions is None else dict(group_fractions)
+        if self.candidate_groups is not None:
+            if (not self.group_fractions
+                or any(not isinstance(k, str) or not isinstance(v, str)
+                       for k, v in self.candidate_groups.items())
+                or any(not isinstance(k, str) or k == "__ueg__"
+                       for k in self.group_fractions)
+                or any(not np.isfinite(v) or v <= 0 for v in self.group_fractions.values())
+                or not np.isclose(sum(self.group_fractions.values()), 1, rtol=0, atol=1e-12)
+                or not set(self.candidate_groups.values()) <= self.group_fractions.keys()):
+                raise ValueError("Candidate groups need named positive fractions summing to one")
         self.blocksize, self.rhocut, self.jitter = blocksize, rhocut, jitter
         self.constraints = Constraints() if constraints is None else constraints
         if not isinstance(self.constraints, Constraints):
@@ -254,7 +270,9 @@ class FineTuner:
                 }
         return records
 
-    def _select_controls(self, kernel, records):
+    def _select_controls(self, kernel, records, record_ids=None):
+        if self.candidate_groups is not None:
+            return self._select_grouped_controls(kernel, records, record_ids)
         # Equal deterministic sampling budgets per system protect small molecules
         # against a much larger surface grid. The reduction itself is the existing
         # DFTKernel pivoted-Cholesky implementation, not random point selection.
@@ -278,6 +296,76 @@ class FineTuner:
         if not np.isfinite(pool).all():
             raise ValueError("Control candidates contain nonfinite normalized features")
         kernel.X1ctrl = kernel._reduce_npts(pool)
+
+    def _select_grouped_controls(self, kernel, records, record_ids):
+        """Stratify only the pool; keep the existing kernel reduction unchanged.
+
+        IDs are the original ReactionSet IDs (also for constraints.molecules).
+        None identifies an internally generated UEG record. Fractions budget
+        physical records; UEG is appended separately at the legacy per-record
+        budget. Unused capacity is not redistributed. Each record receives an
+        equal candidate-row budget; its spin multiplicity determines how many
+        grid points fit in that budget.
+        """
+        if record_ids is None or len(record_ids) != len(records):
+            raise ValueError("Grouped candidates require matching record IDs")
+        groups = []
+        for key in record_ids:
+            if key is not None and key not in self.candidate_groups:
+                raise ValueError(f"Missing candidate group for record {key!r}")
+            groups.append("__ueg__" if key is None else self.candidate_groups[key])
+        counts = {g: groups.count(g) for g in set(groups)}
+        limits = {g: int(self.max_candidates * f) for g, f in self.group_fractions.items()}
+        budgets = {g: limits[g] // n for g, n in counts.items() if g != "__ueg__"}
+        ueg_grid_budget = max(1, self.max_candidates // len(records) // 2)
+        pool, origins = [], []
+        per_record = []
+        for record, key, group in zip(records, record_ids, groups):
+            valid = np.flatnonzero(record["rho_data"][:, 0].sum(0) > self.rhocut)
+            rows_per_point = 0
+            grid_budget = 0
+            if valid.size:
+                probe = self._base.settings.normalizers.get_normalized_feature_vector(
+                    record["desc"][..., valid[:1]]
+                )
+                rows_per_point = len(kernel.get_descriptors(probe))
+                grid_budget = (ueg_grid_budget if group == "__ueg__"
+                               else budgets[group] // rows_per_point)
+            n = min(grid_budget, valid.size)
+            rows = 0
+            if n:
+                ids = valid[np.linspace(0, valid.size - 1, n, dtype=int)]
+                sample = self._base.settings.normalizers.get_normalized_feature_vector(
+                    record["desc"][..., ids]
+                )
+                candidates = kernel.get_descriptors(sample)
+                rows = len(candidates)
+                pool.append(candidates)
+                origins.extend([(key, group)] * rows)
+            per_record.append(dict(record_id=key, group=group, grid_budget=grid_budget,
+                                   candidate_budget=(None if group == "__ueg__" else budgets[group]),
+                                   rows_per_grid_point=rows_per_point,
+                                   sampled_grid_points=int(n), candidate_rows=rows))
+        if not pool:
+            raise ValueError("No control candidates above the density cutoff")
+        pool = np.concatenate(pool)
+        if not np.isfinite(pool).all():
+            raise ValueError("Control candidates contain nonfinite normalized features")
+        kernel.X1ctrl = kernel._reduce_npts(pool)
+        # _reduce_npts returns exact input rows. Attribute duplicate descriptors
+        # to their first pool occurrence and expose all possible origin groups.
+        lookup = {}
+        for i, row in enumerate(pool):
+            lookup.setdefault(row.tobytes(), []).append(i)
+        selected = []
+        for row in kernel.X1ctrl:
+            ids = lookup[row.tobytes()]
+            i = ids[0]
+            selected.append(dict(pool_index=i, record_id=origins[i][0], group=origins[i][1],
+                                 possible_groups=sorted({origins[j][1] for j in ids})))
+        return dict(group_candidate_limits=limits, records=per_record,
+                    candidate_rows=len(pool), selected=selected,
+                    duplicate_attribution="first pool occurrence; possible_groups lists ambiguity")
 
     def _base_total(self, record):
         self._validate_settings(record)
@@ -320,6 +408,11 @@ class FineTuner:
             _composition(record)  # needed even when absolute safeguards are disabled
         ueg = self._ueg_records()
         ueg_records = {f"ueg:{key}": value for key, value in ueg.items()}
+        candidate_ids = list(train.records)
+        if protection is not None:
+            candidate_ids += list(protection.records)
+        candidate_ids += [None] * len(ueg)
+        candidate_info = []
         kernels = self._kernels()
         engine = MOLGP2(kernels, deepcopy(self._base.settings))
         engine.numerical_epsilon = self.jitter
@@ -327,9 +420,9 @@ class FineTuner:
         # CPU implementations; explicit device quadratures dispatch separately.
         with policy(None):
             for kernel in kernels:
-                self._select_controls(
-                    kernel, list(records.values()) + list(ueg.values())
-                )
+                candidate_info.append(self._select_controls(
+                    kernel, list(records.values()) + list(ueg.values()), candidate_ids
+                ))
                 for key, record in {**records, **ueg_records}.items():
                     kernel.cov_dict[key] = covariance(
                         kernel,
@@ -431,6 +524,15 @@ class FineTuner:
             "gpu_compatible": True,
             "base_sha256": sha256(self._base_yaml.encode()).hexdigest(),
         }
+        if self.candidate_groups is not None:
+            self.fit_info["candidate_configuration"] = {
+                "candidate_groups": self.candidate_groups,
+                "group_fractions": self.group_fractions,
+                "max_candidates": self.max_candidates,
+                "ueg_separate": True,
+                "budget_unit": "descriptor_rows",
+            }
+            self.fit_info["candidate_pools"] = candidate_info
         self.engine, self._model = engine, model
         return self
 
@@ -520,6 +622,11 @@ class FineTuner:
             "constraints": self.constraints.config(),
             "needs_molecules": self.constraints.molecules is not None,
         }
+        if self.candidate_groups is not None:
+            model.ft_metadata.update(
+                candidate_groups=self.candidate_groups,
+                group_fractions=self.group_fractions,
+            )
         Path(path).write_text(yaml.dump(model, Dumper=yaml.CDumper), encoding="utf-8")
         return Path(path)
 
@@ -549,6 +656,8 @@ class FineTuner:
         }
         result = cls(
             base,
+            candidate_groups=meta.get("candidate_groups"),
+            group_fractions=meta.get("group_fractions"),
             constraints=constraints or Constraints(**meta["constraints"]),
             device=device,
             **config,
