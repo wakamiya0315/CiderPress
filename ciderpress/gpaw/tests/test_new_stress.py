@@ -9,6 +9,41 @@ from ciderpress.gpaw.tests.test_radial_cutoff import slice_factory
 PAIRS = ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1))
 
 
+def test_missing_tau_stress_requires_explicit_diagnostic(monkeypatch):
+    from types import SimpleNamespace as NS
+    from gpaw.core import UGDesc
+    from gpaw.mpi import serial_comm
+    from gpaw.new.calculation import DFT
+    from ciderpress.gpaw.tests.test_new_forces import case
+
+    f, density, _, _ = case(monkeypatch)
+    # The review's stable periodic skew-grid probe, including stencil checks.
+    f.grid = UGDesc(cell=[[7., .4, .2], [.2, 8., .1], [.3, .2, 9.]],
+                    size=(8, 10, 12), pbc=True)
+    density.nt_sR.desc = f.grid
+    density.tau_state = None
+    calc = NS(density=density, pot_calc=NS(xc=f), comm=serial_comm,
+              results={'stress': np.zeros(6)})
+    with pytest.raises(RuntimeError, match='joint tau state.*joint-tau recipe'):
+        DFT.calculate_stress(calc)
+    with pytest.raises(RuntimeError, match='joint tau state.*joint-tau recipe'):
+        f.validate_stress_calculation()
+    with pytest.raises(ValueError, match='diagnostic test exception'):
+        with f.diagnostic_stress_without_tau():
+            with f.diagnostic_stress_without_tau():
+                f.validate_stress_calculation()
+                np.testing.assert_array_equal(DFT.calculate_stress(calc), 0.)
+            f.validate_stress_calculation()
+            # Opt-in never skips periodic-bulk checks.
+            f.grid.pbc_c[2] = False
+            with pytest.raises(NotImplementedError, match='periodic bulk'):
+                f.validate_stress_calculation()
+            f.grid.pbc_c[2] = True
+            raise ValueError('diagnostic test exception')
+    with pytest.raises(RuntimeError, match='joint tau state'):
+        f.validate_stress_calculation()
+
+
 def directions():
     for i, j in PAIRS:
         A = np.zeros((3, 3))
@@ -49,8 +84,9 @@ def test_joint_tau_stress_certificate(monkeypatch, problem):
     if problem is None:
         f.validate_tau_state_stress(state, ibzwfs)
     else:
-        with pytest.raises((RuntimeError, NotImplementedError)):
-            f.validate_tau_state_stress(state, ibzwfs)
+        with f.diagnostic_stress_without_tau():
+            with pytest.raises((RuntimeError, NotImplementedError)):
+                f.validate_tau_state_stress(state, ibzwfs)
 
 
 @pytest.mark.parametrize('shape', [(8, 10, 12), (7, 9, 11)])
@@ -161,13 +197,15 @@ def test_stress_private_inputs_and_stale_rejection(monkeypatch):
 
     monkeypatch.setattr(backend, '_StressEngine', Private)
     T = [[d.nt_sR] * 6]
-    np.testing.assert_array_equal(f._stress_on_root(d, interpolate, T), np.eye(3))
+    with f.diagnostic_stress_without_tau():
+        np.testing.assert_array_equal(f._stress_on_root(d, interpolate, T), np.eye(3))
     np.testing.assert_array_equal(d.nt_sR.data, 1.)
     np.testing.assert_array_equal(d.taut_sR.data, .3)
     assert f._paw_ready and f.engine is not f._stress_engine
     d.nt_sR.data.flat[0] += .01
-    with pytest.raises(RuntimeError, match='current XC state'):
-        f._stress_on_root(d, interpolate, T)
+    with f.diagnostic_stress_without_tau():
+        with pytest.raises(RuntimeError, match='current XC state'):
+            f._stress_on_root(d, interpolate, T)
 
 
 def test_kpoint_stress_assembly():
@@ -201,9 +239,13 @@ def test_kpoint_stress_assembly():
         dft.potential, _, _ = dft.pot_calc.calculate(dft.density, dft.ibzwfs)
         return dft
 
+    def diagnostic_stress(dft):
+        with dft.pot_calc.xc.diagnostic_stress_without_tau():
+            return dft.pot_calc.stress(dft.ibzwfs, dft.density, dft.potential)
+
     if world.rank == 0:
         ref = target(serial_comm, 1)
-        reference = ref.pot_calc.stress(ref.ibzwfs, ref.density, ref.potential)
+        reference = diagnostic_stress(ref)
     else:
         reference = None
     reference = broadcast(reference, 0, comm=world)
@@ -215,7 +257,7 @@ def test_kpoint_stress_assembly():
         calls[0] += 1
         return original(*args)
     f._stress_on_root = counted
-    actual = dft.pot_calc.stress(dft.ibzwfs, dft.density, dft.potential)
+    actual = diagnostic_stress(dft)
     # Observed same-code 1-vs-2-rank assembly floor is 2.59e-10
     # Ha/Bohr^3 (PAW/grid reductions), below the 1e-7 port gate.
     np.testing.assert_allclose(actual, reference, atol=1e-9, rtol=1e-10)
@@ -224,13 +266,13 @@ def test_kpoint_stress_assembly():
         raise RuntimeError('root stress failure')
     f._stress_on_root = fail
     with pytest.raises(RuntimeError, match='root stress failure'):
-        dft.pot_calc.stress(dft.ibzwfs, dft.density, dft.potential)
+        diagnostic_stress(dft)
     if world.rank == 0:
         def bad_validation():
             raise RuntimeError('root stress validation failure')
         f.validate_stress_calculation = bad_validation
     with pytest.raises(RuntimeError, match='root stress validation failure'):
-        dft.pot_calc.stress(dft.ibzwfs, dft.density, dft.potential)
+        diagnostic_stress(dft)
 
 
 def test_dipole_stress_rejected():

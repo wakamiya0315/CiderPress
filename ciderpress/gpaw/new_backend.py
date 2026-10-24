@@ -15,6 +15,7 @@ Density packing doubles off-diagonal entries; Hamiltonian packing does not.
 """
 
 import hashlib
+from contextlib import contextmanager
 from copy import copy
 from functools import lru_cache
 from importlib.resources import files
@@ -574,6 +575,25 @@ class CiderNewMGGAFunctional(MGGAFunctional):
                     self._stress_on_root(density, interpolate, T))
         return result
 
+    @contextmanager
+    def diagnostic_stress_without_tau(self):
+        """Opt in to untracked fixed-input stress, without SCF/FD certification.
+
+        Use only around an isolated fixed-input diagnostic. All other stress
+        guards remain active, including joint/current-output checks whenever
+        a tau state exists. This runtime opt-in is not serialized in a GPW.
+        """
+        name = '_diagnostic_stress_without_tau'
+        previous = self.__dict__.get(name)
+        self._diagnostic_stress_without_tau = True
+        try:
+            yield
+        finally:
+            if previous is None:
+                self.__dict__.pop(name, None)
+            else:
+                self._diagnostic_stress_without_tau = previous
+
     def validate_stress_calculation(self):
         # The force validator also accepts collinear spins. Stress retains
         # its independent one-spin certificate.
@@ -583,7 +603,13 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         if not np.all(self.grid.pbc_c):
             raise NotImplementedError('New CIDER stress requires periodic bulk')
         state = getattr(self._density, 'tau_state', None)
-        if state is not None:
+        if state is None:
+            if not getattr(self, '_diagnostic_stress_without_tau', False):
+                raise RuntimeError(
+                    'New CIDER stress requires a joint tau state; use the '
+                    'joint-tau recipe: mixer={"tau": {"method": "joint"}} '
+                    'and converge the current state (bench docs/guide/README.md)')
+        else:
             self.validate_tau_state_stress(state)
         if not getattr(self, '_stress_stencil_checked', False):
             from gpaw.fd_operators import gradient_strain_coefficients
