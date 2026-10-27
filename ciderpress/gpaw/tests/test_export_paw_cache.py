@@ -119,3 +119,61 @@ def test_cache_key_dependencies(change):
 def test_invalid_capacity():
     with pytest.raises(ValueError, match='positive integer'):
         ExportPAWCache(0)
+
+
+@pytest.mark.parametrize('gpu', [False, True])
+def test_full_export_cold_warm_uncached_bitwise(gpu, tmp_path):
+    """Real PAW/FFT fixture: compare every exported field and both replays."""
+    from ase import Atoms
+    from gpaw import GPAW
+    from ciderpress import gpu as device
+    from ciderpress.gpaw.new_export import (DEFAULT_PAW_CACHE, export_training_data,
+                                           integrate_xc)
+    if gpu and device._real_cupy() is None:
+        pytest.skip('requires real CUDA CuPy')
+    atoms = Atoms('H2', positions=[[2, 2, 1.6], [2, 2, 2.4]],
+                  cell=[4]*3, pbc=True)
+    param = CiderXC()
+    calc = GPAW(legacy_gpaw=False, mode=dict(name='pw', ecut=100), xc=param,
+                h=.3, nbands=2, symmetry='off', txt=None,
+                parallel=dict(gpu=gpu, domain=1, band=1, distribute_density=False))
+    # A prescribed, finite n/tau/D fixture exercises the complete exporter
+    # without conflating this cache identity test with SCF convergence.
+    calc.create_new_calculation(atoms)
+    dft = calc.dft
+    for wfs in dft.ibzwfs:
+        wfs.psit_nX.data[:] = 0
+        wfs.psit_nX.data[0] = wfs.psit_nX.xp.asarray(np.exp(-.7*wfs.psit_nX.desc.ekin_G))
+        wfs._occ_n = np.array([1., 0.])
+        wfs._eig_n = np.zeros(2)
+    dft.density.update_ked(dft.ibzwfs)
+    dft.density.taut_sR.data[:] += .05
+    dft.potential, dft.energies, _ = dft.pot_calc.calculate(dft.density, dft.ibzwfs)
+    dft.energies.set(band=0., entropy=0., extrapolation=0.)
+    dft.calculate_energy()
+    DEFAULT_PAW_CACHE.clear()
+    try:
+        cold = export_training_data(calc, gpu=gpu)
+        first = DEFAULT_PAW_CACHE.info().copy()
+        warm = export_training_data(calc, gpu=gpu)
+        second = DEFAULT_PAW_CACHE.info().copy()
+        uncached = export_training_data(calc, gpu=gpu, paw_cache=None)
+        assert first['misses'] > 0 and second['hits'] > first['hits']
+        assert second['misses'] == first['misses']
+        assert DEFAULT_PAW_CACHE.info() == second
+        assert cold.keys() == warm.keys() == uncached.keys()
+        for key in cold:
+            a, b, c = (r[key] for r in (cold, warm, uncached))
+            if isinstance(a, np.ndarray):
+                assert a.dtype == b.dtype == c.dtype
+                assert a.shape == b.shape == c.shape
+                assert a.tobytes() == b.tobytes() == c.tobytes(), key
+            elif isinstance(a, (float, np.floating)):
+                assert np.float64(a).tobytes() == np.float64(b).tobytes() == np.float64(c).tobytes(), key
+            else:
+                assert a == b == c, key
+        replay = [np.float64(integrate_xc(r, param, gpu=gpu)).tobytes()
+                  for r in (cold, warm, uncached)]
+        assert replay[0] == replay[1] == replay[2]
+    finally:
+        DEFAULT_PAW_CACHE.clear()

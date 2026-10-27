@@ -317,6 +317,16 @@ before scientific use of a fitted model.
 
 ## Verification
 
+`FineTuner(..., candidate_mask="inference")` opts into candidate masks that
+match each residual's inference cutoff: SEP uses each spin-scaled density row,
+NPOL uses the physical total density. Equality at `rhocut` is included;
+`rhocut=0` disables masking. Signed PAW weights are retained. Sampling budgets
+count candidate rows per active record, including for mixed spin counts;
+group fractions apply after masking, with internal UEG candidates budgeted
+separately. The option is saved for refits. Its default, `None`, preserves the
+historical selection, coefficients and predictions (the 77045b4 golden fixture
+checks those bytes with one BLAS thread).
+
 ### Optional CUDA fitting and prediction
 
 This path is experimental: the p12-ftgpu real-record audit found FP64
