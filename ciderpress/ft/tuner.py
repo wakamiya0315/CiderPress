@@ -1,6 +1,7 @@
 """MOLGP2 orchestration with a frozen mean and finite-set safeguards."""
 
 from copy import deepcopy
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
@@ -101,7 +102,9 @@ class FineTuner:
     control points remain unchanged. ``n_control`` is a cap per component.
 
     ``prior_scale`` is the standard deviation of the dimensionless residual
-    enhancement. Noise is specified per observation by ReactionSet. Candidate
+    enhancement, either a scalar shared by all added kernels or a mapping
+    with exactly the requested component keys (for example x and c).
+    Noise is specified per observation by ReactionSet. Candidate
     pools are deterministically subsampled before the engine's dense pivoted
     Cholesky selection, keeping candidate memory bounded by max_candidates.
     """
@@ -151,7 +154,14 @@ class FineTuner:
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{key} must be a positive integer")
-        for key, value in (("prior_scale", prior_scale), ("jitter", jitter)):
+        if isinstance(prior_scale, Mapping):
+            if set(prior_scale) != set(components):
+                raise ValueError("prior_scale mapping must have exactly the component keys")
+            prior_scale = dict(prior_scale)
+            scales = [(f"prior_scale[{k}]", v) for k, v in prior_scale.items()]
+        else:
+            scales = [("prior_scale", prior_scale)]
+        for key, value in [*scales, ("jitter", jitter)]:
             if not np.isfinite(value) or value <= 0:
                 raise ValueError(f"{key} must be positive and finite")
         if not np.isfinite(rhocut) or rhocut < 0:
@@ -229,9 +239,11 @@ class FineTuner:
                 raise ValueError(f"Base {component} template has no RBF evaluator")
             rbf = template.fevals[0]
             length_scale = np.sqrt(0.5 / rbf._exps)
+            scale = (self.prior_scale[component]
+                     if isinstance(self.prior_scale, Mapping) else self.prior_scale)
             kernels.append(
                 DFTKernel2(
-                    self.prior_scale**2 * DiffRBF(length_scale=length_scale),
+                    scale**2 * DiffRBF(length_scale=length_scale),
                     deepcopy(template.feature_list),
                     mode,
                     baseline,
