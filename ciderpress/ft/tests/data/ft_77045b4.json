@@ -1,0 +1,18 @@
+{
+  "tuner_commit": "77045b4ec9",
+  "tuner_sha256": "8bb8355130f307d33cb596fa8a751346a8ee0d11edd0d704961f041021b7de5d",
+  "fixture_sha256": "e1099f62639db72b02fdee209737fb5b96be12226146589bd74abb033a4a64c7",
+  "numpy": "2.0.2",
+  "scipy": "1.14.1",
+  "threads": 1,
+  "location": "TSUBAME cpu_4",
+  "ciderpress_source": "complete git archive of 77045b4ec9; shared native libraries",
+  "ft_source_sha256": {
+    "ciderpress/ft/__init__.py": "11887af0863b5072ea342537cbb226a922323c16661de835ccd88491dcd35e0c",
+    "ciderpress/ft/data.py": "4a54a8e814397142a9aa402ca27a1be09e51887766b22be62d6e2b035e768f44",
+    "ciderpress/ft/io.py": "91d6ca11e326f395fcc589aef2b5564af5648f0ad796c2ac4ff56e145496ea33",
+    "ciderpress/ft/records.py": "713f167efdde6064100d269a3c2b77de1d6f3b776614fad482f9671cf283170d",
+    "ciderpress/ft/tuner.py": "8bb8355130f307d33cb596fa8a751346a8ee0d11edd0d704961f041021b7de5d"
+  },
+  "inputs": "synthetic(seed=119,nspin=2,nsystems=3); n_control=8; max_candidates=100; default constraints/prior/cutoff/jitter; x,c,xc"
+}

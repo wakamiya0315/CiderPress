@@ -107,6 +107,8 @@ class FineTuner:
     Noise is specified per observation by ReactionSet. Candidate
     pools are deterministically subsampled before the engine's dense pivoted
     Cholesky selection, keeping candidate memory bounded by max_candidates.
+    ``candidate_mask='inference'`` opts into per-component cutoff masks and
+    candidate-row budgets. None preserves the historical selector bitwise.
     """
 
     def __init__(
@@ -120,6 +122,7 @@ class FineTuner:
         max_candidates=1500,
         candidate_groups=None,
         group_fractions=None,
+        candidate_mask=None,
         blocksize=4000,
         rhocut=1e-8,
         jitter=1e-12,
@@ -170,6 +173,9 @@ class FineTuner:
             raise ValueError("max_candidates must be at least n_control")
         self.n_control, self.components = n_control, components
         self.prior_scale, self.max_candidates = prior_scale, max_candidates
+        if candidate_mask not in (None, 'inference'):
+            raise ValueError("candidate_mask must be None or 'inference'")
+        self.candidate_mask = candidate_mask
         if (candidate_groups is None) != (group_fractions is None):
             raise ValueError("candidate_groups and group_fractions must be supplied together")
         self.candidate_groups = None if candidate_groups is None else dict(candidate_groups)
@@ -283,6 +289,8 @@ class FineTuner:
         return records
 
     def _select_controls(self, kernel, records, record_ids=None):
+        if self.candidate_mask == 'inference':
+            return self._select_masked_controls(kernel, records, record_ids)
         if self.candidate_groups is not None:
             return self._select_grouped_controls(kernel, records, record_ids)
         # Equal deterministic sampling budgets per system protect small molecules
@@ -308,6 +316,87 @@ class FineTuner:
         if not np.isfinite(pool).all():
             raise ValueError("Control candidates contain nonfinite normalized features")
         kernel.X1ctrl = kernel._reduce_npts(pool)
+
+    def _candidate_rows(self, kernel, record):
+        """Indices in inference order, before sampling or normalization.
+
+        SEP uses spin-scaled row densities; NPOL uses physical total density.
+        Inference excludes strictly *below* rhocut, and disables masking at 0.
+        Signed integration weights do not participate in candidate selection.
+        """
+        rho = record['rho_data'][:, 0]
+        density = rho if kernel.mode == 'SEP' else rho.sum(0) / record['nspin']
+        mask = density >= self.rhocut if self.rhocut > 0 else np.ones_like(density, bool)
+        return np.flatnonzero(mask)
+
+    def _masked_descriptors(self, kernel, record, rows):
+        if kernel.mode == 'SEP':
+            spin, point = np.divmod(rows, record['desc'].shape[-1])
+            # Normalize only active spin rows, even when the other spin's
+            # descriptors are arbitrary (or invalid at zero density).
+            sample = record['desc'][spin, :, point].T[None]
+        else:
+            sample = record['desc'][..., rows]
+        sample = self._base.settings.normalizers.get_normalized_feature_vector(sample)
+        return kernel.get_descriptors(sample)
+
+    def _select_masked_controls(self, kernel, records, record_ids):
+        """Opt-in inference mask with candidate-row budgets per active record.
+
+        Group fractions apply to physical records; internal UEG records have
+        a separate equal-record budget. Empty records consume no budget.
+        The default selector and its floating-point operations are untouched.
+        """
+        grouped = self.candidate_groups is not None
+        if grouped and (record_ids is None or len(record_ids) != len(records)):
+            raise ValueError('Grouped candidates require matching record IDs')
+        keys = record_ids if record_ids is not None else [None] * len(records)
+        groups = []
+        for key in keys:
+            if grouped and key is not None and key not in self.candidate_groups:
+                raise ValueError(f'Missing candidate group for record {key!r}')
+            groups.append(('__ueg__' if key is None else self.candidate_groups[key])
+                          if grouped else '__all__')
+        valid = [self._candidate_rows(kernel, r) for r in records]
+        counts = {g: sum(bool(v.size) for v, h in zip(valid, groups) if g == h)
+                  for g in set(groups)}
+        active = sum(bool(v.size) for v in valid)
+        if not active:
+            raise ValueError('No control candidates above the density cutoff')
+        limits = ({g: int(self.max_candidates * f)
+                   for g, f in self.group_fractions.items()} if grouped
+                  else {'__all__': self.max_candidates})
+        budgets = {g: limit // counts[g] for g, limit in limits.items()
+                   if counts.get(g, 0)}
+        budgets['__ueg__'] = max(1, self.max_candidates // active)
+        pool, origins, per_record = [], [], []
+        for record, key, group, rows in zip(records, keys, groups, valid):
+            budget = budgets.get(group, 0)
+            n = min(budget, rows.size)
+            if n:
+                selected = rows[np.linspace(0, rows.size - 1, n, dtype=int)]
+                pool.append(self._masked_descriptors(kernel, record, selected))
+                origins.extend([(key, group)] * n)
+            per_record.append(dict(record_id=key, group=group, candidate_budget=budget,
+                                   valid_candidate_rows=int(rows.size), candidate_rows=int(n)))
+        if not pool:
+            raise ValueError('No control candidates within the candidate budgets')
+        pool = np.concatenate(pool)
+        if not np.isfinite(pool).all():
+            raise ValueError('Control candidates contain nonfinite normalized features')
+        kernel.X1ctrl = kernel._reduce_npts(pool)
+        lookup = {}
+        for i, row in enumerate(pool):
+            lookup.setdefault(row.tobytes(), []).append(i)
+        selected = []
+        for row in kernel.X1ctrl:
+            ids = lookup[row.tobytes()]
+            i = ids[0]
+            selected.append(dict(pool_index=i, record_id=origins[i][0], group=origins[i][1],
+                                 possible_groups=sorted({origins[j][1] for j in ids})))
+        return dict(mask='inference', group_candidate_limits=limits, records=per_record,
+                    candidate_rows=len(pool), selected=selected,
+                    duplicate_attribution='first pool occurrence; possible_groups lists ambiguity')
 
     def _select_grouped_controls(self, kernel, records, record_ids):
         """Stratify only the pool; keep the existing kernel reduction unchanged.
@@ -639,6 +728,8 @@ class FineTuner:
                 candidate_groups=self.candidate_groups,
                 group_fractions=self.group_fractions,
             )
+        if self.candidate_mask is not None:
+            model.ft_metadata['candidate_mask'] = self.candidate_mask
         Path(path).write_text(yaml.dump(model, Dumper=yaml.CDumper), encoding="utf-8")
         return Path(path)
 
@@ -670,6 +761,7 @@ class FineTuner:
             base,
             candidate_groups=meta.get("candidate_groups"),
             group_fractions=meta.get("group_fractions"),
+            candidate_mask=meta.get('candidate_mask'),
             constraints=constraints or Constraints(**meta["constraints"]),
             device=device,
             **config,
