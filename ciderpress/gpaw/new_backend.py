@@ -16,7 +16,7 @@ Density packing doubles off-diagonal entries; Hamiltonian packing does not.
 
 import hashlib
 from contextlib import contextmanager
-from copy import copy
+from copy import copy, deepcopy
 from functools import lru_cache
 from importlib.resources import files
 from pathlib import Path
@@ -85,6 +85,9 @@ class CiderXC(XC):
     numerical settings on restoration. Explicit YAML paths are supported.
     ``smooth_floor_width > 0`` selects a non-official CPU smooth variant of
     the NLDF lower exponent floor; zero keeps the official evaluation.
+    ``rvv10={...}`` composes GPAW's RVV10NonLocal on the total smooth density
+    (PW, periodic, undistributed fine grid). ``gradient='lattice'`` selects
+    fixed lattice-axis differences. Neither option changes the default.
     """
 
     type = 'MGGA'
@@ -92,7 +95,7 @@ class CiderXC(XC):
     def __init__(self, model='CIDER26XCSURFSCI', *, xmix=1.0,
                  xkernel=None, ckernel=None, Nalpha=None, lambd=1.8,
                  qmax=300.0, pasdw_ovlp_fit=True, pasdw_store_funcs=False,
-                 smooth_floor_width=0.0):
+                 smooth_floor_width=0.0, rvv10=None, gradient=None):
         super().__init__('CIDER26XCSURFSCI')
         from ciderpress.dft.exponent_floor import check_floor_cpu, validate_floor_width
         smooth_floor_width = validate_floor_width(smooth_floor_width)
@@ -135,11 +138,24 @@ class CiderXC(XC):
         self._cell = None
         if smooth_floor_width:
             self.nldf['smooth_floor_width'] = smooth_floor_width
+        self.rvv10 = None if rvv10 is None else deepcopy(dict(rvv10))
+        if self.rvv10 is not None and 'q_mesh' in self.rvv10:
+            mesh = self.rvv10['q_mesh']
+            if mesh is not None:
+                self.rvv10['q_mesh'] = np.asarray(mesh, float).tolist()
+        if gradient is not None and gradient not in ('voronoi', 'lattice'):
+            raise ValueError("gradient must be 'voronoi' or 'lattice'")
+        self.gradient = gradient
 
     def todict(self):
-        return dict(name=self.name, cider_new_version=1, model=self.model,
+        d = dict(name=self.name, cider_new_version=1, model=self.model,
                     model_sha256=self.model_sha256, options=self.options.copy(),
                     nldf=self.nldf.copy(), cell=self._cell)
+        if self.rvv10 is not None:
+            d['rvv10'] = deepcopy(self.rvv10)
+        if self.gradient is not None:
+            d['gradient'] = self.gradient
+        return d
 
     def functional(self, *, collinear, atoms=None):
         if not collinear:
@@ -165,7 +181,8 @@ def restore_cider_xc(d, *, expected=None):
     """
     if d.get('cider_new_version') != 1:
         raise ValueError('Unsupported New CIDER restart schema')
-    xc = CiderXC(d['model'], **d['options'])
+    extra = {key: d[key] for key in ('rvv10', 'gradient') if key in d}
+    xc = CiderXC(d['model'], **d['options'], **extra)
     if d['model_sha256'] != xc.model_sha256:
         raise ValueError('New CIDER model SHA256 mismatch')
     if d['nldf'] != xc.nldf:
@@ -175,7 +192,50 @@ def restore_cider_xc(d, *, expected=None):
         for key in ('model_sha256', 'options', 'nldf'):
             if xc.todict()[key] != expected.todict()[key]:
                 raise ValueError('New CIDER requested settings mismatch: ' + key)
+        for key in ('rvv10', 'gradient'):
+            if xc.todict().get(key) != expected.todict().get(key):
+                raise ValueError('New CIDER requested settings mismatch: ' + key)
     return xc
+
+
+class _RVV10Contribution:
+    """Optional smooth-grid composition; no PAW or explicit atomic term.
+
+    The host five-channel derivative is augmented before CIDER's discrete
+    divergence.  The kernel tensor is +dE/dstrain, extensive (Ha), and is
+    added once after the ordinary smooth and stencil stress terms.
+    Call only inside the functional's recorded GPU policy/device scope.
+    """
+
+    def __init__(self, options, grid, device):
+        from gpaw.xc.rvv10 import RVV10NonLocal
+        if grid.comm.size != 1:
+            raise NotImplementedError('rVV10 requires an undistributed fine grid')
+        if not grid.pbc_c.all() or grid.zerobc_c.any():
+            raise NotImplementedError('rVV10 requires a fully periodic fine grid')
+        self.nl = RVV10NonLocal(**options)
+        self.grid = grid
+        self.device = device
+        self.energy = 0.0  # Ha, including beta * integral(n)
+
+    def add(self, e, rho, dedrho, *, stress=False):
+        from gpaw.gpu import as_np
+        xp = np
+        if self.device is not None:
+            from gpaw.gpu import cupy
+            xp = cupy
+            if xp.cuda.Device().id != self.device:
+                raise ValueError('rVV10 differs from its recorded CUDA device')
+        n = rho[:, 0].sum(axis=0)
+        grad = rho[:, 1:4].sum(axis=0)
+        a2 = (grad * grad).sum(axis=0)
+        out = self.nl.calculate(xp.asarray(n), xp.asarray(a2),
+                                self.grid.cell_cv, xp, stress=stress)
+        e += as_np(out['e'])
+        dedrho[:, 0] += as_np(out['v'])
+        dedrho[:, 1:4] += 2 * as_np(out['d']) * grad
+        self.energy = out['energy']
+        return out.get('stress')
 
 
 class _SerialAtomDist:
@@ -290,7 +350,10 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         from ciderpress.dft.exponent_floor import check_floor_cpu
         self._smooth_floor_width = param.options.get('smooth_floor_width', 0.0)
         check_floor_cpu(self._smooth_floor_width, device=self._device)
-        old = MGGA(LibXC('PBE'), stencil=2)
+        if param.gradient is None:
+            old = MGGA(LibXC('PBE'), stencil=2)
+        else:
+            old = MGGA(LibXC('PBE'), stencil=2, gradient=param.gradient)
         old.type = 'MGGA'
         old.name = 'CIDER26XCSURFSCI'
         # Keep the reference MGGA/Gradient objects on NumPy. Optional device
@@ -298,6 +361,10 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         super().__init__(old, grid)
         self.xp = xp
         self.param = param
+        self._rvv10 = (None if param.rvv10 is None else
+                       _RVV10Contribution(param.rvv10, grid, self._device))
+        if self._rvv10 is not None:
+            self.nl_energy = 0.0  # Last SCF smooth nonlocal energy, Ha.
         self.engine = _Engine(param, grid, self.grad_v)
         self._relpos = None
         self.setups = None
@@ -444,6 +511,9 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         engine.dens.nt_sg = n.data
         e, rho, dedrho = engine._get_cider_inputs(n.data, tau.data)
         engine.calc_cider(e, rho, dedrho)
+        if self._rvv10 is not None:
+            self._rvv10.add(e, rho, dedrho)
+            self.nl_energy = self._rvv10.energy
         # In this phase the FFT and GPAW grids have identical serial layouts.
         v = n.new(zeroed=True)
         d = n.new(zeroed=True)
@@ -612,12 +682,14 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         else:
             self.validate_tau_state_stress(state)
         if not getattr(self, '_stress_stencil_checked', False):
-            from gpaw.fd_operators import gradient_strain_coefficients
-            for i in range(3):
-                for j in range(i, 3):
-                    strain = np.zeros((3, 3))
-                    strain[i, j] = strain[j, i] = 1. if i == j else .5
-                    gradient_strain_coefficients(self.grid._gd.h_cv, strain)
+            if not (self.grad_v and all(getattr(g, 'lattice', False)
+                                        for g in self.grad_v)):
+                from gpaw.fd_operators import gradient_strain_coefficients
+                for i in range(3):
+                    for j in range(i, 3):
+                        strain = np.zeros((3, 3))
+                        strain[i, j] = strain[j, i] = 1. if i == j else .5
+                        gradient_strain_coefficients(self.grid._gd.h_cv, strain)
             # Cell/grid changes are rejected by the existing SCF adapter.
             self._stress_stencil_checked = True
 
@@ -688,6 +760,9 @@ class CiderNewMGGAFunctional(MGGAFunctional):
             try:
                 tensor = np.array([[host_interpolate(component).data
                                     for component in spin] for spin in T])
+                if getattr(self, '_rvv10', None) is not None:
+                    return engine.stress(n.data.copy(), tau.data.copy(), packed,
+                                         tensor, rvv10=self._rvv10)
                 return engine.stress(n.data.copy(), tau.data.copy(), packed,
                                      tensor)
             except BaseException:
@@ -798,7 +873,7 @@ class _StressEngine(_ForceEngine):
         finally:
             fft.compute_backward_convolution_with_stress = original
 
-    def stress(self, n, tau, packed, tensor):
+    def stress(self, n, tau, packed, tensor, *, rvv10=None):
         from gpaw.xc.gga import stress_gradient_stencil_term
         from ciderpress.gpaw.cider_paw import cider_smooth_stress
         self.dens.nt_sg = n
@@ -809,11 +884,15 @@ class _StressEngine(_ForceEngine):
             raise ValueError('New CIDER stress requires a finite kinetic tensor')
         e, rho, dedrho = self._get_cider_inputs(n, tau)
         explicit = self.calc_cider(e, rho, dedrho, grad_mode=2)
+        if rvv10 is not None:
+            kernel_stress = rvv10.add(e, rho, dedrho, stress=True)
         smooth = cider_smooth_stress(self.gd, e, rho, dedrho, tensor)
         stencil = stress_gradient_stencil_term(
             self.gd, self.grad_v, n, rho[:, 1:4], dedrho[:, 1:4])
         self.stress_terms = dict(explicit=0.5 * (explicit + explicit.T),
                                  smooth=smooth, stencil=stencil)
+        if rvv10 is not None:
+            self.stress_terms['rvv10_kernel'] = kernel_stress
         result = sum(self.stress_terms.values())
         if not np.isfinite(result).all():
             raise ValueError('Nonfinite New CIDER XC stress')
