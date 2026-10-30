@@ -71,6 +71,53 @@ def test_default_serialization_and_q_mesh():
         CiderXC(gradient='other')
 
 
+def test_beta_restart_and_noncollinear():
+    xc = CiderXC(rvv10=OPTIONS)
+    assert xc.todict()['rvv10']['beta'] == 'augmented'
+    old = xc.todict()
+    old['rvv10'].pop('beta')
+    restored = restore_cider_xc(old)
+    assert restored.rvv10['beta'] == 'smooth'
+    assert 'beta' not in old['rvv10']  # Do not mutate caller's saved data.
+    with pytest.raises(ValueError, match='settings mismatch: rvv10'):
+        restore_cider_xc(old, expected=xc)
+    smooth = CiderXC(rvv10=dict(OPTIONS, beta='smooth'))
+    assert restore_cider_xc(old, expected=smooth).todict() == smooth.todict()
+    with pytest.raises(ValueError, match='beta'):
+        CiderXC(rvv10=dict(OPTIONS, beta='invalid'))
+    with pytest.raises(NotImplementedError, match='noncollinear'):
+        xc.functional(collinear=False)
+
+
+@pytest.mark.parametrize('nspin', [1, 2])
+@pytest.mark.parametrize('beta', ['augmented', 'smooth'])
+def test_beta_paw_composition(nspin, beta):
+    from gpaw.utilities import pack_density, pack_hermitian
+    from ciderpress.gpaw.new_backend import CiderNewMGGAFunctional
+    grid = UGDesc(cell=CELL, size=(8, 10, 12), pbc=True)
+    nl = _RVV10Contribution(dict(OPTIONS, beta=beta), grid, None)
+    setup = SimpleNamespace(dO_ii=np.array([[.1, .2], [.2, -.3]]))
+    D = np.array([pack_density(np.array([[1., .3], [.3, .4]]))] * nspin)
+    engine = SimpleNamespace(dens=SimpleNamespace(D_asp={0: D}),
+                             dH_asp_tmp={0: np.full_like(D, 7.)}, E_a_tmp={0: 3.})
+    f = object.__new__(CiderNewMGGAFunctional)
+    f.engine, f.setups, f._paw_ready, f._rvv10 = engine, [setup], True, nl
+    h = np.zeros_like(D)
+    energy = f._calculate_paw_correction(setup, D, h, 0)
+    correction = nl.nl.beta * pack_hermitian(setup.dO_ii)
+    if beta == 'augmented':
+        np.testing.assert_array_equal(h, np.full_like(D, 7.) + correction)
+        assert energy == 3. + np.einsum('sp,p->', D, correction)
+        delta = np.zeros_like(D)
+        delta[0, 1] = 1e-4
+        fd = (nl.calculate_paw_correction(setup, D + delta) -
+              nl.calculate_paw_correction(setup, D - delta)) / 2e-4
+        assert fd == pytest.approx(correction[1], abs=1e-13)
+    else:
+        assert energy == 3.
+        np.testing.assert_array_equal(h, np.full_like(D, 7.))
+
+
 def test_layout_rejections():
     for pbc in ([True, True, False], [False]*3):
         grid = UGDesc(cell=CELL, size=(8, 10, 12), pbc=pbc)
@@ -106,7 +153,9 @@ def test_lattice_stress_preflight(monkeypatch):
 
 
 @pytest.mark.parametrize('use_gpu', [False, True])
-def test_fixed_input_gpw_roundtrip(tmp_path, use_gpu, record_property):
+@pytest.mark.parametrize('beta', ['augmented', 'smooth', 'legacy'])
+def test_fixed_input_gpw_roundtrip(tmp_path, use_gpu, beta, record_property,
+                                   monkeypatch):
     """Actual IO on fixed n/tau/D; SCF continuation is a separate harness check."""
     from ase import Atoms
     from gpaw import GPAW
@@ -115,7 +164,8 @@ def test_fixed_input_gpw_roundtrip(tmp_path, use_gpu, record_property):
     device_for(use_gpu)
     atoms=Atoms('H2',positions=[[1.13,1.27,1.31],[1.87,1.34,1.39]],
                 cell=[4.,4.4,4.8],pbc=True)
-    xc=CiderXC(rvv10=OPTIONS,gradient='lattice')
+    xc=CiderXC(rvv10=dict(OPTIONS, beta='smooth' if beta == 'legacy' else beta),
+               gradient='lattice')
     calc=GPAW(mode=dict(name='pw',ecut=80),gpts=(12,14,16),nbands=2,
               xc=xc,legacy_gpaw=False,symmetry='off',txt=None,
               communicator=serial_comm,parallel=dict(gpu=use_gpu))
@@ -131,7 +181,14 @@ def test_fixed_input_gpw_roundtrip(tmp_path, use_gpu, record_property):
         return e,pc.xc.nl_energy
     before=evaluate(dft)
     path=tmp_path/'cider-rvv10.gpw'
-    calc.write(path,mode='all')
+    if beta == 'legacy':
+        saved = xc.todict()
+        saved['rvv10'].pop('beta')
+        with monkeypatch.context() as m:
+            m.setattr(xc, 'todict', lambda: saved)
+            calc.write(path, mode='all')
+    else:
+        calc.write(path,mode='all')
     restored=GPAW(path,legacy_gpaw=False,txt=None,communicator=serial_comm,
         parallel=dict(gpu=use_gpu),
         object_hooks={'xc':lambda d:restore_cider_xc(d,expected=xc)})
