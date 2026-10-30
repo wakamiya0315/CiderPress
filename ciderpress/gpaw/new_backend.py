@@ -638,6 +638,19 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         No communicator other than the engine's private SELF is entered.
         """
         from ciderpress.gpu import policy
+        rvv10 = getattr(self, '_rvv10', None)
+        if (rvv10 is not None and rvv10.kernel is not None and
+                not rvv10.kernel.is_current(density)):
+            # A restored GPW has no CIDER/PAW scratch or nonlocal adjoints.
+            # Recreate both from the supplied retained input, using exactly
+            # the SCF interpolation and engine gradient. Existing state and
+            # property guards below still apply; no SCF is authorized here.
+            if density.taut_sR is None:
+                raise RuntimeError('rVV10 force refresh requires retained tau')
+            with policy(self._device):
+                self.set_density(density)
+                self.calculate(interpolate(density.nt_sR),
+                               interpolate(density.taut_sR))
         self.validate_force_calculation()
         if density is not self._density:
             raise RuntimeError('New CIDER force density is stale')
