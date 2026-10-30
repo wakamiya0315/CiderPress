@@ -88,6 +88,9 @@ class CiderXC(XC):
     ``rvv10={...}`` composes GPAW's RVV10NonLocal on the total smooth density
     (PW, periodic, undistributed fine grid). ``gradient='lattice'`` selects
     fixed lattice-axis differences. Neither option changes the default.
+    rVV10 defaults to beta='augmented' (grid plus PAW beta*dO); beta='smooth'
+    retains the old grid-only convention. restore_cider_xc reads a saved
+    rVV10 dictionary without beta as 'smooth', preserving old GPWs.
     """
 
     type = 'MGGA'
@@ -139,6 +142,10 @@ class CiderXC(XC):
         if smooth_floor_width:
             self.nldf['smooth_floor_width'] = smooth_floor_width
         self.rvv10 = None if rvv10 is None else deepcopy(dict(rvv10))
+        if self.rvv10 is not None:
+            from gpaw.new.rvv10 import validate_beta_mode
+            self.rvv10['beta'] = validate_beta_mode(
+                self.rvv10.get('beta', 'augmented'))
         if self.rvv10 is not None and 'q_mesh' in self.rvv10:
             mesh = self.rvv10['q_mesh']
             if mesh is not None:
@@ -178,10 +185,14 @@ def restore_cider_xc(d, *, expected=None):
     """GPW object hook; refuse changed model bytes or NLDF implementation.
 
     ``expected=CiderXC(...)`` additionally pins the caller's desired settings.
+    Saved rVV10 options without a beta key mean the legacy 'smooth' convention,
+    whereas fresh CiderXC(rvv10=...) input defaults to 'augmented'.
     """
     if d.get('cider_new_version') != 1:
         raise ValueError('Unsupported New CIDER restart schema')
-    extra = {key: d[key] for key in ('rvv10', 'gradient') if key in d}
+    extra = {key: deepcopy(d[key]) for key in ('rvv10', 'gradient') if key in d}
+    if extra.get('rvv10') is not None:
+        extra['rvv10'].setdefault('beta', 'smooth')
     xc = CiderXC(d['model'], **d['options'], **extra)
     if d['model_sha256'] != xc.model_sha256:
         raise ValueError('New CIDER model SHA256 mismatch')
@@ -199,7 +210,7 @@ def restore_cider_xc(d, *, expected=None):
 
 
 class _RVV10Contribution:
-    """Optional smooth-grid composition; no PAW or explicit atomic term.
+    """Optional smooth-grid composition with a separate PAW beta correction.
 
     The host five-channel derivative is augmented before CIDER's discrete
     divergence.  The kernel tensor is +dE/dstrain, extensive (Ha), and is
@@ -213,13 +224,24 @@ class _RVV10Contribution:
             raise NotImplementedError('rVV10 requires an undistributed fine grid')
         if not grid.pbc_c.all() or grid.zerobc_c.any():
             raise NotImplementedError('rVV10 requires a fully periodic fine grid')
+        from gpaw.new.rvv10 import validate_beta_mode
+        options = dict(options)
+        self.beta_mode = validate_beta_mode(options.pop('beta', 'augmented'))
         self.nl = RVV10NonLocal(**options)
         self.grid = grid
         self.device = device
         self.energy = 0.0  # Ha, including beta * integral(n)
 
+    def calculate_paw_correction(self, setup, D_sp, dH_sp=None):
+        from gpaw.new.rvv10 import paw_beta_correction
+        if self.beta_mode == 'smooth':
+            return 0.0
+        return paw_beta_correction(setup, D_sp, dH_sp, self.nl.beta)
+
     def add(self, e, rho, dedrho, *, stress=False):
         from gpaw.gpu import as_np
+        if len(rho) not in (1, 2):
+            raise NotImplementedError('rVV10 requires one or two collinear spins')
         xp = np
         if self.device is not None:
             from gpaw.gpu import cupy
@@ -542,7 +564,11 @@ class CiderNewMGGAFunctional(MGGAFunctional):
             if dH_sp.shape != D_sp.shape:
                 raise ValueError('New CIDER PAW D/dH spin shapes differ')
             dH_sp += engine.dH_asp_tmp[a]
-        return float(engine.E_a_tmp[a])
+        energy = float(engine.E_a_tmp[a])
+        rvv10 = getattr(self, '_rvv10', None)
+        if rvv10 is not None:
+            energy += rvv10.calculate_paw_correction(setup, D_sp, dH_sp)
+        return energy
 
     def validate_force_calculation(self):
         if not self._paw_ready or self._density is None:
