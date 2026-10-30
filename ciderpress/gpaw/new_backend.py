@@ -85,12 +85,15 @@ class CiderXC(XC):
     numerical settings on restoration. Explicit YAML paths are supported.
     ``smooth_floor_width > 0`` selects a non-official CPU smooth variant of
     the NLDF lower exponent floor; zero keeps the official evaluation.
-    ``rvv10={...}`` composes GPAW's RVV10NonLocal on the total smooth density
+    ``rvv10={...}`` composes GPAW's RVV10NonLocal on a private kernel density
     (PW, periodic, undistributed fine grid). ``gradient='lattice'`` selects
     fixed lattice-axis differences. Neither option changes the default.
-    rVV10 defaults to beta='augmented' (grid plus PAW beta*dO); beta='smooth'
-    retains the old grid-only convention. restore_cider_xc reads a saved
-    rVV10 dictionary without beta as 'smooth', preserving old GPWs.
+    rVV10 defaults to beta='augmented', kernel_density='augmented': smooth
+    density plus smooth core plus electronic compensation, without Delta0.
+    Its complete potential supplies the grid and PAW Hamiltonians; no
+    additional PAW beta energy is added. kernel_density='smooth' selects
+    the legacy grid input, with beta='smooth' or the beta-stage PAW term.
+    Missing beta/kernel_density keys in saved GPWs each mean 'smooth'.
     """
 
     type = 'MGGA'
@@ -143,9 +146,11 @@ class CiderXC(XC):
             self.nldf['smooth_floor_width'] = smooth_floor_width
         self.rvv10 = None if rvv10 is None else deepcopy(dict(rvv10))
         if self.rvv10 is not None:
-            from gpaw.new.rvv10 import validate_beta_mode
+            from gpaw.new.rvv10 import validate_beta_mode, validate_kernel_density
             self.rvv10['beta'] = validate_beta_mode(
                 self.rvv10.get('beta', 'augmented'))
+            self.rvv10['kernel_density'] = validate_kernel_density(
+                self.rvv10.get('kernel_density', 'augmented'), self.rvv10['beta'])
         if self.rvv10 is not None and 'q_mesh' in self.rvv10:
             mesh = self.rvv10['q_mesh']
             if mesh is not None:
@@ -185,14 +190,15 @@ def restore_cider_xc(d, *, expected=None):
     """GPW object hook; refuse changed model bytes or NLDF implementation.
 
     ``expected=CiderXC(...)`` additionally pins the caller's desired settings.
-    Saved rVV10 options without a beta key mean the legacy 'smooth' convention,
-    whereas fresh CiderXC(rvv10=...) input defaults to 'augmented'.
+    Saved rVV10 options without beta/kernel_density keys use 'smooth' for
+    each missing key. Fresh CiderXC(rvv10=...) defaults to augmented/augmented.
     """
     if d.get('cider_new_version') != 1:
         raise ValueError('Unsupported New CIDER restart schema')
     extra = {key: deepcopy(d[key]) for key in ('rvv10', 'gradient') if key in d}
     if extra.get('rvv10') is not None:
         extra['rvv10'].setdefault('beta', 'smooth')
+        extra['rvv10'].setdefault('kernel_density', 'smooth')
     xc = CiderXC(d['model'], **d['options'], **extra)
     if d['model_sha256'] != xc.model_sha256:
         raise ValueError('New CIDER model SHA256 mismatch')
@@ -210,11 +216,12 @@ def restore_cider_xc(d, *, expected=None):
 
 
 class _RVV10Contribution:
-    """Optional smooth-grid composition with a separate PAW beta correction.
+    """Optional rVV10 with a private augmented density and complete potential.
 
-    The host five-channel derivative is augmented before CIDER's discrete
-    divergence.  The kernel tensor is +dE/dstrain, extensive (Ha), and is
-    added once after the ordinary smooth and stencil stress terms.
+    Augmented mode adds a complete nonlocal potential to channel zero.
+    CIDER's gradient channels are untouched. Its extensive tensor includes
+    the kernel, private gradient stencil and compensation strain terms.
+    Smooth mode retains the historical composition for exact reproduction.
     Call only inside the functional's recorded GPU policy/device scope.
     """
 
@@ -224,21 +231,41 @@ class _RVV10Contribution:
             raise NotImplementedError('rVV10 requires an undistributed fine grid')
         if not grid.pbc_c.all() or grid.zerobc_c.any():
             raise NotImplementedError('rVV10 requires a fully periodic fine grid')
-        from gpaw.new.rvv10 import validate_beta_mode
+        from gpaw.new.rvv10 import validate_beta_mode, validate_kernel_density
         options = dict(options)
         self.beta_mode = validate_beta_mode(options.pop('beta', 'augmented'))
+        self.kernel_density_mode = validate_kernel_density(
+            options.pop('kernel_density', 'augmented'), self.beta_mode)
+        self.kernel = None
         self.nl = RVV10NonLocal(**options)
         self.grid = grid
         self.device = device
         self.energy = 0.0  # Ha, including beta * integral(n)
 
-    def calculate_paw_correction(self, setup, D_sp, dH_sp=None):
+    def set_context(self, setups, relpos_ac, atomdist):
+        if self.kernel_density_mode == 'augmented':
+            from gpaw.new.rvv10_kernel import KernelDensity
+            from ciderpress.gpu import policy
+            from gpaw.gpu import cupy
+            with policy(self.device):
+                self.kernel = KernelDensity(
+                    self.grid, setups, relpos_ac, atomdist,
+                    np if self.device is None else cupy)
+
+    def set_density(self, density):
+        if self.kernel is not None:
+            self.kernel.set_density(density)
+
+    def calculate_paw_correction(self, setup, D_sp, dH_sp=None, a=None):
         from gpaw.new.rvv10 import paw_beta_correction
+        if self.kernel_density_mode == 'augmented':
+            self.kernel.add_paw_derivative(setup, dH_sp, a)
+            return 0.0
         if self.beta_mode == 'smooth':
             return 0.0
         return paw_beta_correction(setup, D_sp, dH_sp, self.nl.beta)
 
-    def add(self, e, rho, dedrho, *, stress=False):
+    def add(self, e, rho, dedrho, *, stress=False, grad_v=None):
         from gpaw.gpu import as_np
         if len(rho) not in (1, 2):
             raise NotImplementedError('rVV10 requires one or two collinear spins')
@@ -249,6 +276,15 @@ class _RVV10Contribution:
             if xp.cuda.Device().id != self.device:
                 raise ValueError('rVV10 differs from its recorded CUDA device')
         n = rho[:, 0].sum(axis=0)
+        if self.kernel_density_mode == 'augmented':
+            if grad_v is None:
+                raise RuntimeError('rVV10 requires the CIDER engine gradient')
+            out = self.kernel.evaluate(xp.asarray(n), grad_v, self.nl,
+                                       stress=stress)
+            e += as_np(out['e'])
+            dedrho[:, 0] += as_np(out['v'])
+            self.energy = out['energy']
+            return out.get('stress')
         grad = rho[:, 1:4].sum(axis=0)
         a2 = (grad * grad).sum(axis=0)
         out = self.nl.calculate(xp.asarray(n), xp.asarray(a2),
@@ -386,7 +422,7 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         self._rvv10 = (None if param.rvv10 is None else
                        _RVV10Contribution(param.rvv10, grid, self._device))
         if self._rvv10 is not None:
-            self.nl_energy = 0.0  # Last SCF smooth nonlocal energy, Ha.
+            self.nl_energy = 0.0  # Last SCF grid nonlocal energy, Ha.
         self.engine = _Engine(param, grid, self.grad_v)
         self._relpos = None
         self.setups = None
@@ -458,6 +494,8 @@ class CiderNewMGGAFunctional(MGGAFunctional):
                     clone.cider_contribs = None
                     copies[id(setup)] = clone
                 engine.setups[a] = copies[id(setup)]
+        if getattr(self, '_rvv10', None) is not None:
+            self._rvv10.set_context(setups, self._relpos, atomdist)
         engine.spos_ac = self._relpos
         engine.atom_partition = AtomPartition(engine.world, atomdist.rank_a.copy())
         if self._density is None:
@@ -494,6 +532,8 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         engine.dens.D_asp = D_asp
         self._nspins = nspins
         self._density = density
+        if getattr(self, '_rvv10', None) is not None:
+            self._rvv10.set_density(density)
         self._paw_ready = False
 
     def calculate(self, nt_sr, taut_sr=None):
@@ -534,7 +574,7 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         e, rho, dedrho = engine._get_cider_inputs(n.data, tau.data)
         engine.calc_cider(e, rho, dedrho)
         if self._rvv10 is not None:
-            self._rvv10.add(e, rho, dedrho)
+            self._rvv10.add(e, rho, dedrho, grad_v=engine.grad_v)
             self.nl_energy = self._rvv10.energy
         # In this phase the FFT and GPAW grids have identical serial layouts.
         v = n.new(zeroed=True)
@@ -567,7 +607,7 @@ class CiderNewMGGAFunctional(MGGAFunctional):
         energy = float(engine.E_a_tmp[a])
         rvv10 = getattr(self, '_rvv10', None)
         if rvv10 is not None:
-            energy += rvv10.calculate_paw_correction(setup, D_sp, dH_sp)
+            energy += rvv10.calculate_paw_correction(setup, D_sp, dH_sp, a)
         return energy
 
     def validate_force_calculation(self):
@@ -641,7 +681,12 @@ class CiderNewMGGAFunctional(MGGAFunctional):
                                                    self.setups, self._relpos)
             engine = self._force_engine
             try:
-                return engine.forces(n.data.copy(), tau.data.copy(), packed)
+                result = engine.forces(n.data.copy(), tau.data.copy(), packed)
+                rvv10 = getattr(self, '_rvv10', None)
+                if rvv10 is not None and rvv10.kernel is not None:
+                    from gpaw.gpu import as_np
+                    result += as_np(rvv10.kernel.forces())
+                return result
             except BaseException:
                 # Never reuse a partially evaluated private engine.
                 del self._force_engine
@@ -910,7 +955,9 @@ class _StressEngine(_ForceEngine):
             raise ValueError('New CIDER stress requires a finite kinetic tensor')
         e, rho, dedrho = self._get_cider_inputs(n, tau)
         explicit = self.calc_cider(e, rho, dedrho, grad_mode=2)
-        if rvv10 is not None:
+        augmented = (rvv10 is not None and
+                     rvv10.kernel_density_mode == 'augmented')
+        if rvv10 is not None and not augmented:
             kernel_stress = rvv10.add(e, rho, dedrho, stress=True)
         smooth = cider_smooth_stress(self.gd, e, rho, dedrho, tensor)
         stencil = stress_gradient_stencil_term(
@@ -918,6 +965,9 @@ class _StressEngine(_ForceEngine):
         self.stress_terms = dict(explicit=0.5 * (explicit + explicit.T),
                                  smooth=smooth, stencil=stencil)
         if rvv10 is not None:
+            if augmented:
+                kernel_stress = rvv10.add(e, rho, dedrho, stress=True,
+                                          grad_v=self.grad_v)
             self.stress_terms['rvv10_kernel'] = kernel_stress
         result = sum(self.stress_terms.values())
         if not np.isfinite(result).all():
