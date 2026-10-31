@@ -284,7 +284,7 @@ class _RVV10Contribution:
             e += as_np(out['e'])
             dedrho[:, 0] += as_np(out['v'])
             self.energy = out['energy']
-            return out.get('stress')
+            return as_np(out['stress']) if stress else None
         grad = rho[:, 1:4].sum(axis=0)
         a2 = (grad * grad).sum(axis=0)
         out = self.nl.calculate(xp.asarray(n), xp.asarray(a2),
