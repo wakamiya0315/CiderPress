@@ -16,7 +16,7 @@ from ciderpress.gpaw.new_backend import (
     CiderXC, _RVV10Contribution, add_gradient_correction, restore_cider_xc,
 )
 
-OPTIONS = dict(b=11.95, C=.0093, nq=12, nR=8192, q_block=4,
+OPTIONS = dict(kernel_density='smooth', b=11.95, C=.0093, nq=12, nR=8192, q_block=4,
                desaturate=True, q_top=2.5, q_cut=.5, q_min=1e-4)
 CELL = np.array([[7., .4, .2], [.2, 8., .1], [.3, .2, 9.]])
 PAIRS = ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1))
@@ -153,7 +153,7 @@ def test_lattice_stress_preflight(monkeypatch):
 
 
 @pytest.mark.parametrize('use_gpu', [False, True])
-@pytest.mark.parametrize('beta', ['augmented', 'smooth', 'legacy'])
+@pytest.mark.parametrize('beta', ['augmented', 'smooth', 'legacy', 'kernel'])
 def test_fixed_input_gpw_roundtrip(tmp_path, use_gpu, beta, record_property,
                                    monkeypatch):
     """Actual IO on fixed n/tau/D; SCF continuation is a separate harness check."""
@@ -164,8 +164,13 @@ def test_fixed_input_gpw_roundtrip(tmp_path, use_gpu, beta, record_property,
     device_for(use_gpu)
     atoms=Atoms('H2',positions=[[1.13,1.27,1.31],[1.87,1.34,1.39]],
                 cell=[4.,4.4,4.8],pbc=True)
-    xc=CiderXC(rvv10=dict(OPTIONS, beta='smooth' if beta == 'legacy' else beta),
-               gradient='lattice')
+    options=dict(OPTIONS, beta='smooth' if beta == 'legacy' else
+                 'augmented' if beta == 'kernel' else beta)
+    if beta == 'kernel':
+        # Fresh input takes the new augmented/augmented default, and the
+        # actual GPW must restore both the key and its n/tau/D potential.
+        options.pop('kernel_density')
+    xc=CiderXC(rvv10=options, gradient='lattice')
     calc=GPAW(mode=dict(name='pw',ecut=80),gpts=(12,14,16),nbands=2,
               xc=xc,legacy_gpaw=False,symmetry='off',txt=None,
               communicator=serial_comm,parallel=dict(gpu=use_gpu))
